@@ -225,6 +225,9 @@ struct LinalgOpTilingInterface
     }
     return tilingInterfaceOp.getTiledImplementation(b, mappedOffsets,
                                                     mappedSizes);
+    // return TilingResult{
+    //     tilingResult->tiledOps,
+    //     SmallVector<Value>{tilingResult->tiledValues[operandNumber]}};
   }
 
   FailureOr<TilingResult>

@@ -1106,7 +1106,8 @@ mlir::scf::tileConsumerAndFuseProducersUsingSCF(
 //===----------------------------------------------------------------------===//
 
 static std::tuple<Operation *, std::optional<OpOperand *>>
-getUntiledConsumerFromSliceDestSCFFor(OpOperand &source) {
+getUntiledConsumerFromSliceDestSCFFor(OpOperand &source,
+                                      unsigned &operandNumber) {
   // Step 1. Fetch the corresponding output
   // TODO(avarma): Make it generic for multiple values yielding scf.for.
   unsigned yieldOperandNumber = source.getOperandNumber();
@@ -1124,21 +1125,21 @@ getUntiledConsumerFromSliceDestSCFFor(OpOperand &source) {
         untiledConsumer = user;
         break;
       }
+      operandNumber++;
     }
     break;
   }
   return {untiledConsumer, destinationIterArg};
 }
 
-static bool
-checkAssumptionForFusingConsumer(tensor::InsertSliceOp candidateSliceOp) {
-  Value result = candidateSliceOp.getResult();
+static bool checkAssumptionForFusingConsumer(Operation *op) {
+  Value result = op->getResult(0);
   Value::user_range users = result.getUsers();
   if (std::distance(users.begin(), users.end()) != 1) {
     LLVM_DEBUG(llvm::dbgs() << "Too many uses of the candidate slice op\n");
     return false;
   }
-  if (!isa<scf::YieldOp>(*users.begin())) {
+  if (isa<tensor::InsertSliceOp>(op) && !isa<scf::YieldOp>(*users.begin())) {
     LLVM_DEBUG(llvm::dbgs() << "Expected scf.yield to be the only user\n");
     return false;
   }
@@ -1150,14 +1151,16 @@ checkAssumptionForFusingConsumer(tensor::InsertSliceOp candidateSliceOp) {
 static FailureOr<scf::SCFFuseConsumerOfSliceResult>
 tileAndFuseConsumerOfSliceSCFFor(RewriterBase &rewriter,
                                  tensor::InsertSliceOp candidateSliceOp) {
+  auto funcOp = candidateSliceOp->getParentOfType<func::FuncOp>();
   // ASSUMING THAT YIELD OP IS ONLY YIELDING JUST ONE VALUE.
   if (!checkAssumptionForFusingConsumer(candidateSliceOp)) {
     return rewriter.notifyMatchFailure(candidateSliceOp,
                                        "needs only scf.yield as its user");
   }
   // 1. Get the consumer of the source.
-  auto [consumerOp, destinationInitArg] =
-      getUntiledConsumerFromSliceDestSCFFor(candidateSliceOp->getOpOperand(0));
+  unsigned operandNumber = 0;
+  auto [consumerOp, destinationInitArg] = getUntiledConsumerFromSliceDestSCFFor(
+      candidateSliceOp->getOpOperand(0), operandNumber);
   if (!consumerOp)
     return failure();
   OpBuilder::InsertionGuard g(rewriter);
@@ -1179,6 +1182,11 @@ tileAndFuseConsumerOfSliceSCFFor(RewriterBase &rewriter,
   }
 
   // Check consumer don't use more than one result of containingOp.
+  assert(forOp.getResults().size() == 1 &&
+         "expect exactly one result of the containing op");
+  if (!checkAssumptionForFusingConsumer(forOp)) {
+    return rewriter.notifyMatchFailure(forOp, "scf.for has more than 1 uses");
+  }
   Value bridge(nullptr);
   SmallVector<unsigned> operandNums;
   for (auto [idx, opd] : llvm::enumerate((consumerOp->getOperands()))) {
@@ -1207,13 +1215,13 @@ tileAndFuseConsumerOfSliceSCFFor(RewriterBase &rewriter,
   // Check consumer is not using scf.for's output as init.
   SmallVector<Value> dpsInits = llvm::to_vector<4>(
       llvm::map_range(dstOp.getDpsInits(), [](Value v) { return v; }));
-  if (llvm::is_contained(dpsInits, bridge)) {
+  if (llvm::is_contained(dpsInits, forOp.getResult(0))) {
     return rewriter.notifyMatchFailure(
         consumerOp, "consumer op take result of scf.for as init");
   }
 
   // Check result was inserted only once.
-  int64_t bridgeResultIdx = cast<OpResult>(bridge).getResultNumber();
+  // int64_t bridgeResultIdx = cast<OpResult>(bridge).getResultNumber();
 
   Location loc = forOp.getLoc();
   SmallVector<OpFoldResult> offsets = candidateSliceOp.getMixedOffsets();
@@ -1227,56 +1235,6 @@ tileAndFuseConsumerOfSliceSCFFor(RewriterBase &rewriter,
         candidateSliceOp, "containingOp's result yield with stride");
   }
 
-  SmallVector<OpFoldResult> iterDomainOffsets, iterDomainSizes;
-
-  // Try to get iter domain position from input position.
-  if (failed(tileableConsumer.getIterDomainTilePositionFromOperandPosition(
-          rewriter, operandNums.front(), offsets, sizes, iterDomainOffsets,
-          iterDomainSizes))) {
-    return rewriter.notifyMatchFailure(
-        tileableConsumer, "can't get iter domain position from input position");
-  }
-
-  // Try to get all containing op result's position from iter domain position.
-  llvm::SmallVector<std::pair<llvm::SmallVector<OpFoldResult>,
-                              llvm::SmallVector<OpFoldResult>>>
-      resultPositions(consumerOp->getNumResults());
-  for (auto [idx, v] : llvm::enumerate(consumerOp->getResults())) {
-    if (failed(tileableConsumer.getResultTilePosition(
-            rewriter, idx, iterDomainOffsets, iterDomainSizes,
-            resultPositions[idx].first, resultPositions[idx].second))) {
-      return rewriter.notifyMatchFailure(
-          tileableConsumer,
-          "can't get result domain position from iter domain position");
-    }
-  }
-
-  // All check passed, try to fuse consumer.
-  // Create tiled implementation of containing op.
-  FailureOr<TilingResult> tileAndFuseResult =
-      tileableConsumer.getTiledImplementationFromOperandPosition(
-          rewriter, operandNums.front(), offsets, sizes);
-  if (failed(tileAndFuseResult)) {
-    return rewriter.notifyMatchFailure(tileableConsumer,
-                                       "get tiled implementation failed");
-  }
-
-  auto tiledOps = tileAndFuseResult->tiledOps;
-  if (failed(tileAndFuseResult) || tiledOps.size() != 1) {
-    return rewriter.notifyMatchFailure(tileableConsumer,
-                                       "failed to tile consumer op: ");
-  }
-
-  // Replace tiled op's operand.
-  for (auto operandNum : operandNums) {
-    tiledOps[0]->setOperand(operandNum, candidateSliceOp.getSource());
-  }
-  rewriter.replaceUsesWithIf(bridge, forOp.getInits()[bridgeResultIdx],
-                             [&](OpOperand &use) {
-                               Operation *op = use.getOwner();
-                               return forOp->isProperAncestor(op);
-                             });
-
   SmallVector<Value> newOuts(forOp.getInits());
   newOuts.append(dpsInits);
 
@@ -1285,39 +1243,67 @@ tileAndFuseConsumerOfSliceSCFFor(RewriterBase &rewriter,
   auto newforOp = rewriter.create<scf::ForOp>(loc, forOp.getLowerBound(),
                                               forOp.getUpperBound(),
                                               forOp.getStep(), newOuts);
-  rewriter.eraseBlock(newforOp.getBody());
-  newforOp.getRegion().takeBody(forOp.getRegion());
+  // Move the loop body to the new op.
+  Block *loopBody = forOp.getBody();
+  Block *newLoopBody = newforOp.getBody();
+  rewriter.mergeBlocks(
+      loopBody, newLoopBody,
+      newLoopBody->getArguments().take_front(loopBody->getNumArguments()));
 
-  for (auto v : dpsInits) {
-    newforOp.getBody()->addArgument(v.getType(), v.getLoc());
-    auto bbArgs = newforOp.getBody()->getArguments();
-    rewriter.replaceUsesWithIf(v, bbArgs.back(), [&](OpOperand &use) {
-      Operation *op = use.getOwner();
-      return newforOp->isProperAncestor(op);
-    });
+  // Clone the consumer after the insert_slice.
+  rewriter.setInsertionPointAfter(candidateSliceOp);
+  SmallVector<Value> newForOpBlockArgsForConsumerDest;
+  for (unsigned i = loopBody->getNumArguments(),
+                n = newLoopBody->getArguments().size();
+       i < n; i++) {
+    newForOpBlockArgsForConsumerDest.push_back(newLoopBody->getArgument(i));
   }
+  auto clonedConsumerOp = cast<TilingInterface>(cloneOpAndUpdateDestinationArgs(
+      rewriter, consumerOp, newForOpBlockArgsForConsumerDest));
+
+  // Replace scf.for result's use in the consumer with insert_slice result.
+  rewriter.replaceAllUsesWith(forOp.getResult(0), candidateSliceOp.getResult());
+
+  // Generate the tiled implementation of the consumer of the source.
+  rewriter.setInsertionPoint(candidateSliceOp);
+  FailureOr<TilingResult> tileAndFuseResult =
+      tensor::replaceInsertSliceWithTiledConsumer(
+          rewriter, candidateSliceOp,
+          clonedConsumerOp->getOpOperand(operandNumber));
+  if (failed(tileAndFuseResult)) {
+    return rewriter.notifyMatchFailure(tileableConsumer,
+                                       "failed to tile consumer op: ");
+  }
+
+  // Update the source of the candidateSlice to be the cloned consumer.
+  SmallVector<Value> candidateSliceOpOperands =
+      llvm::to_vector(candidateSliceOp->getOperands());
+  candidateSliceOpOperands[0] = tileAndFuseResult->tiledValues[0];
+  tensor::InsertSliceOp clonedCandidateSliceOp =
+      mlir::clone(rewriter, candidateSliceOp,
+                  candidateSliceOp->getResultTypes(), candidateSliceOpOperands);
+
+  rewriter.replaceAllUsesWith(candidateSliceOp, candidateSliceOp.getSource());
+  rewriter.eraseOp(clonedConsumerOp);
 
   // Fix terminator.
   scf::YieldOp oldTerminatorOp =
       static_cast<scf::YieldOp>(newforOp.getBody()->getTerminator());
 
-  SmallVector<Value> newYieldOperands(oldTerminatorOp.getResults());
-  rewriter.setInsertionPoint(candidateSliceOp);
-  auto bbArgs = newforOp.getBody()->getArguments();
-  for (auto [idx, v] : llvm::enumerate(tiledOps[0]->getResults())) {
-    SmallVector<OpFoldResult> strides(resultPositions[idx].first.size(),
-                                      rewriter.getIndexAttr(1));
-    newYieldOperands.push_back(rewriter.create<tensor::InsertSliceOp>(
-        candidateSliceOp->getLoc(), v,
-        bbArgs[1 + forOp.getInits().size() + idx], resultPositions[idx].first,
-        resultPositions[idx].second, strides));
+  SmallVector<Value> newYieldOperands;
+  for (Value val : oldTerminatorOp.getResults()) {
+    if (val == candidateSliceOp.getSource()) {
+      newYieldOperands.push_back(candidateSliceOp.getResult());
+    } else {
+      newYieldOperands.push_back(val);
+    }
   }
+  newYieldOperands.push_back(clonedCandidateSliceOp.getResult());
   rewriter.setInsertionPointAfter(oldTerminatorOp);
   rewriter.create<scf::YieldOp>(loc, newYieldOperands);
-
   rewriter.eraseOp(oldTerminatorOp);
 
-  // Replace the result of forall and consumer op.
+  // Replace the result of for and consumer op.
   for (auto result : llvm::enumerate(forOp.getResults())) {
     rewriter.replaceAllUsesWith(result.value(),
                                 newforOp->getResult(result.index()));
@@ -1331,9 +1317,10 @@ tileAndFuseConsumerOfSliceSCFFor(RewriterBase &rewriter,
 
   // Need to erase the old for.
   rewriter.eraseOp(forOp);
+  rewriter.eraseOp(consumerOp);
 
   return scf::SCFFuseConsumerOfSliceResult{
-      consumerOp, tiledOps[0]->getResult(0), {}};
+      consumerOp, tileAndFuseResult->tiledOps[0]->getResult(0), {}};
 }
 
 static std::tuple<Operation *, std::optional<OpOperand *>>
