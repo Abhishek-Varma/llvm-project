@@ -45,10 +45,11 @@ module attributes {transform.with_named_sequence} {
 //      CHECK:      %[[MAT_OUT_SLICE:.*]] = tensor.extract_slice %[[MAT_OUT_ARG]]
 //      CHECK:      %[[MAT_OUT:.*]] = linalg.generic
 // CHECK-SAME:              outs(%[[MAT_OUT_SLICE]] : tensor<32xf32>)
+//      CHECK:      %[[SLICE_OPERAND1:.*]] = tensor.extract_slice %[[MAT_OUT]][%[[IV]]] [32] [1]
 //      CHECK:      %[[SLICE_OPERAND2:.*]] = tensor.extract_slice %0[%[[IV]]] [32] [1]
 //      CHECK:      %[[SLICE_OUT:.*]] = tensor.extract_slice %[[ELEM_OUT_ARG]][%[[IV]]] [32] [1]
 //      CHECK:      %[[ELEM_OUT:.*]] = linalg.elemwise_binary {fun = #linalg.binary_fn<add>}
-// CHECK-SAME:              ins(%[[MAT_OUT]], %[[SLICE_OPERAND2]] :
+// CHECK-SAME:              ins(%[[SLICE_OPERAND1]], %[[SLICE_OPERAND2]] :
 // CHECK-SAME:              outs(%[[SLICE_OUT]] :
 //      CHECK:      %[[INSERT_ELEM:.*]] = tensor.insert_slice %[[ELEM_OUT]] into %[[ELEM_OUT_ARG]][%[[IV]]] [32] [1]
 //      CHECK:      %[[INSERT_MAT:.*]] = tensor.insert_slice %[[MAT_OUT]] into %[[MAT_OUT_ARG]][%[[IV]]] [32] [1]
@@ -91,20 +92,21 @@ module attributes {transform.with_named_sequence} {
 // CHECK-SAME:     %[[ARG1:[a-zA-Z0-9]+]]: tensor<32x32xf32>
 // CHECK-SAME:     %[[ARG2:[a-zA-Z0-9]+]]: tensor<64x64xf32>)
 //      CHECK:   %[[OUT_INIT:.*]] = tensor.empty() : tensor<64x64xf32>
-//      CHECK:   %[[FINAL_RESULT:.*]]:2 = scf.forall
+//      CHECK:   %[[FINAL_RESULT:.*]]:2 = scf.forall (%[[IV1:.*]], %[[IV2:.*]]) in (2, 2)
 // CHECK-SAME:      shared_outs(%[[MAT_OUT_ARG:.*]] = %[[ARG2]], %[[ELEM_OUT_ARG:.*]] = %[[OUT_INIT]])
 // CHECK-SAME:   {
 //      CHECK:      %[[MAT_OUT_SLICE:.*]] = tensor.extract_slice %[[MAT_OUT_ARG]]
 //      CHECK:      %[[MAT_OUT:.*]] = linalg.matmul
 // CHECK-SAME:              outs(%[[MAT_OUT_SLICE]] :
-//      CHECK:      %[[SLICE_OPERAND2:.*]] = tensor.extract_slice %[[OUT_INIT]][%arg3, %arg4] [32, 32] [1, 1]
-//      CHECK:      %[[SLICE_OUT:.*]] = tensor.extract_slice %[[ELEM_OUT_ARG]][%arg3, %arg4] [32, 32] [1, 1]
+//      CHECK:      %[[SLICE_OPERAND1:.*]] = tensor.extract_slice %[[MAT_OUT]][%[[IV1]], %[[IV2]]] [32, 32] [1, 1]
+//      CHECK:      %[[SLICE_OPERAND2:.*]] = tensor.extract_slice %[[OUT_INIT]][%[[IV1]], %[[IV2]]] [32, 32] [1, 1]
+//      CHECK:      %[[SLICE_OUT:.*]] = tensor.extract_slice %[[ELEM_OUT_ARG]][%[[IV1]], %[[IV2]]] [32, 32] [1, 1]
 //      CHECK:      %[[ELEM_OUT:.*]] = linalg.elemwise_binary {fun = #linalg.binary_fn<add>}
-// CHECK-SAME:              ins(%[[MAT_OUT]], %[[SLICE_OPERAND2]] :
+// CHECK-SAME:              ins(%[[SLICE_OPERAND1]], %[[SLICE_OPERAND2]] :
 // CHECK-SAME:              outs(%[[SLICE_OUT]] :
 //      CHECK:      scf.forall.in_parallel {
-//      CHECK:          tensor.parallel_insert_slice %[[ELEM_OUT]] into %[[ELEM_OUT_ARG]]
-//      CHECK:          tensor.parallel_insert_slice %[[MAT_OUT]] into %[[MAT_OUT_ARG]]
+//      CHECK:          tensor.parallel_insert_slice %[[MAT_OUT]] into %[[MAT_OUT_ARG]][%[[IV1]], %[[IV2]]] [32, 32] [1, 1]
+//      CHECK:          tensor.parallel_insert_slice %[[ELEM_OUT]] into %[[ELEM_OUT_ARG]][%[[IV1]], %[[IV2]]] [32, 32] [1, 1]
 //      CHECK:       }
 //      CHECK:   }
 //      CHECK:   return %[[FINAL_RESULT]]#1 :
