@@ -469,6 +469,100 @@ struct UnPackOpTiling
       return failure();
     return tilingResult.value();
   }
+
+  LogicalResult getIterationDomainTileFromOperandTile(
+      Operation *op, OpBuilder &b, unsigned operandNumber,
+      ArrayRef<OpFoldResult> _offsets, ArrayRef<OpFoldResult> _sizes,
+      SmallVectorImpl<OpFoldResult> &resultOffsets,
+      SmallVectorImpl<OpFoldResult> &resultSizes) const {
+    auto unPackOp = cast<UnPackOp>(op);
+    Location loc = unPackOp.getLoc();
+
+    int64_t numTiles = unPackOp.getInnerDimsPos().size();
+    auto offsets = _offsets.drop_back(numTiles);
+    auto sizes = _sizes.drop_back(numTiles);
+    // The tiling is applied on interchanged dimensions. We have to undo the
+    // interchange to map sizes and offsets to the original input.
+    int64_t outputRank = unPackOp.getDestRank();
+    SmallVector<OpFoldResult> origOffsets(offsets.begin(), offsets.end());
+    SmallVector<OpFoldResult> origSizes(sizes.begin(), sizes.end());
+    applyPermToRange(origOffsets, origSizes,
+                     invertPermutationVector(unPackOp.getOuterDimsPerm()));
+
+    DenseMap<int64_t, OpFoldResult> dimAndTileMapping =
+        unPackOp.getDimAndTileMapping();
+
+    for (auto dim : llvm::seq<int64_t>(0, outputRank)) {
+      using AV = affine::AffineValueExpr;
+      affine::AffineBuilder ab(b, loc);
+      AffineExpr dim0, dim1, sym;
+      bindDims(b.getContext(), dim0, dim1);
+      bindSymbols(b.getContext(), sym);
+      if (dimAndTileMapping.count(dim)) {
+        // If the data dimension is tiled, the i-th index is the product of
+        // offset_i and tile_i, and the i-th size is the product of sizes_i and
+        // tile_i.
+        auto avOffset = AV(dim0).bind(origOffsets[dim]);
+        auto avSize = AV(dim0).bind(origSizes[dim]);
+        auto avTileSize = AV(sym).bind(dimAndTileMapping[dim]);
+        resultOffsets.push_back(ab.mul(avOffset, avTileSize));
+        resultSizes.push_back(ab.mul(avSize, avTileSize));
+      } else {
+        resultOffsets.push_back(origOffsets[dim]);
+        resultSizes.push_back(origSizes[dim]);
+      }
+    }
+    return success();
+  }
+
+  FailureOr<TilingResult>
+  getTiledImplementationAsConsumer(Operation *op, OpBuilder &b,
+                                   ArrayRef<OpFoldResult> _offsets,
+                                   ArrayRef<OpFoldResult> _sizes) const {
+    auto unPackOp = cast<UnPackOp>(op);
+    Location loc = unPackOp.getLoc();
+
+    SmallVector<OpFoldResult> outputOffsets, outputSizes;
+    if (failed(getIterationDomainTileFromOperandTile(
+            op, b, 0, _offsets, _sizes, outputOffsets, outputSizes)))
+      return failure();
+
+    auto oneAttr = b.getI64IntegerAttr(1);
+    int64_t outputRank = unPackOp.getDestRank();
+    SmallVector<OpFoldResult> strides(outputRank, oneAttr);
+
+    SmallVector<Value> tiledOperands;
+    auto extractDestSlice = b.create<ExtractSliceOp>(
+        loc, unPackOp.getDest(), outputOffsets, outputSizes, strides);
+    tiledOperands.push_back(extractDestSlice);
+
+    SmallVector<OpFoldResult> inputOffsets, inputSizes;
+    strides.append(unPackOp.getSourceRank() - outputRank, oneAttr);
+    auto extractSourceSlice = b.create<ExtractSliceOp>(
+        loc, unPackOp.getSource(), _offsets, _sizes, strides);
+    tiledOperands.insert(tiledOperands.begin(), extractSourceSlice);
+    for (auto tile : unPackOp.getInnerTiles())
+      tiledOperands.push_back(tile);
+
+    Operation *tiledUnPackOp =
+        b.create<UnPackOp>(loc, TypeRange{extractDestSlice.getType()},
+                           tiledOperands, op->getAttrs());
+
+    return TilingResult{{tiledUnPackOp},
+                        SmallVector<Value>(tiledUnPackOp->getResults())};
+  }
+
+  FailureOr<TilingResult> getTiledImplementationFromOperandTile(
+      Operation *op, OpBuilder &b, unsigned operandNumber,
+      ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes) const {
+    auto unpackOp = cast<UnPackOp>(op);
+    FailureOr<TilingResult> tilingResult =
+        getTiledImplementationAsConsumer(unpackOp, b, offsets, sizes);
+
+    if (failed(tilingResult))
+      return failure();
+    return tilingResult.value();
+  }
 };
 
 } // namespace
