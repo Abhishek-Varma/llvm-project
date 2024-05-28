@@ -46,10 +46,9 @@ struct PadOpTiling : public TilingInterface::ExternalModel<PadOpTiling, PadOp> {
     return loopRanges;
   }
 
-  FailureOr<TilingResult>
-  getTiledImplementation(Operation *op, OpBuilder &b,
-                         ArrayRef<OpFoldResult> offsets,
-                         ArrayRef<OpFoldResult> sizes) const {
+  FailureOr<TilingResult> getTiledImplementation(
+      Operation *op, OpBuilder &b, ArrayRef<Value> tiledOperands,
+      ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes) const {
     FailureOr<TilingResult> result =
         tensor::bubbleUpPadSlice(b, cast<PadOp>(op), offsets, sizes);
     if (failed(result))
@@ -116,10 +115,9 @@ struct PackOpTiling
     return getPackUnPackIterationDomain<PackOp>(cast<PackOp>(op), b);
   }
 
-  FailureOr<TilingResult>
-  getTiledImplementation(Operation *op, OpBuilder &b,
-                         ArrayRef<OpFoldResult> offsets,
-                         ArrayRef<OpFoldResult> sizes) const {
+  FailureOr<TilingResult> getTiledImplementation(
+      Operation *op, OpBuilder &b, ArrayRef<Value> _tiledOperands,
+      ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes) const {
     auto packOp = cast<PackOp>(op);
     Location loc = packOp.getLoc();
 
@@ -241,7 +239,8 @@ struct PackOpTiling
         return failure();
 
     FailureOr<TilingResult> tilingResult = getTiledImplementation(
-        op, b, offsets.drop_back(numTiles), sizes.drop_back(numTiles));
+        op, b, /*tiledOperands=*/{}, offsets.drop_back(numTiles),
+        sizes.drop_back(numTiles));
     if (failed(tilingResult))
       return failure();
     return tilingResult.value();
@@ -380,10 +379,9 @@ struct UnPackOpTiling
   /// (3, 7). In this context, the tiled unpack produces a (3 * n) elements
   /// because there are 3 rows in total. Follow by a tensor.extract_slice op, we
   /// can get the actual result.
-  FailureOr<TilingResult>
-  getTiledImplementation(Operation *op, OpBuilder &b,
-                         ArrayRef<OpFoldResult> offsets,
-                         ArrayRef<OpFoldResult> sizes) const {
+  FailureOr<TilingResult> getTiledImplementation(
+      Operation *op, OpBuilder &b, ArrayRef<Value> _tiledOperands,
+      ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes) const {
     auto unpackOp = cast<UnPackOp>(op);
     int64_t srcRank = unpackOp.getSourceRank();
     int64_t destRank = unpackOp.getDestRank();
@@ -431,6 +429,8 @@ struct UnPackOpTiling
                                     unpackOp.getDestType().getElementType());
     }
 
+    // TODO: Refactor this as a follow-up and use the passed `_tiledOperands`
+    // instead.
     SmallVector<Value> tiledOperands = {sliceSource, sliceDest};
     for (auto tile : unpackOp.getInnerTiles())
       tiledOperands.push_back(tile);
@@ -464,7 +464,7 @@ struct UnPackOpTiling
                           ArrayRef<OpFoldResult> offsets,
                           ArrayRef<OpFoldResult> sizes) const {
     FailureOr<TilingResult> tilingResult =
-        getTiledImplementation(op, b, offsets, sizes);
+        getTiledImplementation(op, b, /*tiledOperands=*/{}, offsets, sizes);
     if (failed(tilingResult))
       return failure();
     return tilingResult.value();

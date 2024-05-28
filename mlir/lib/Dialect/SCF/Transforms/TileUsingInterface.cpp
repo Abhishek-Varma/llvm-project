@@ -622,7 +622,11 @@ mlir::scf::tileUsingSCF(RewriterBase &rewriter, TilingInterface op,
     }
 
     // 5c. Tile the cloned operation.
-    tilingResult = clonedOp.getTiledImplementation(rewriter, offsets, sizes);
+    SmallVector<Value> tiledOperands =
+        clonedOp.getOperandTilesForIterationDomainTile(rewriter, offsets,
+                                                       sizes);
+    tilingResult = clonedOp.getTiledImplementation(rewriter, tiledOperands,
+                                                   offsets, sizes);
     if (failed(tilingResult)) {
       rewriter.eraseOp(clonedOp);
       return op.emitOpError("faild to tile operation");

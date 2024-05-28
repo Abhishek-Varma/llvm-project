@@ -40,9 +40,11 @@ createSplitPart(RewriterBase &b, Location loc, TilingInterface op,
   sizesCopy[dimension] = size;
   offsetsCopy[dimension] = offset;
 
-  // Create the part as it it were a single tile.
+  // Create the part as it it were a single tile by fetching the operand tiles.
+  SmallVector<Value> tiledOperands =
+      op.getOperandTilesForIterationDomainTile(b, offsetsCopy, sizesCopy);
   FailureOr<TilingResult> tilingResult =
-      op.getTiledImplementation(b, offsetsCopy, sizesCopy);
+      op.getTiledImplementation(b, tiledOperands, offsetsCopy, sizesCopy);
 
   // Insert the results back and populate the `results` list.
   for (auto [index, result] : llvm::enumerate(tilingResult->tiledValues)) {

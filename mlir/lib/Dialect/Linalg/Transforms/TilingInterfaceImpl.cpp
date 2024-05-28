@@ -110,18 +110,24 @@ struct LinalgOpTilingInterface
         }));
   }
 
-  /// Instantiate the tiled implementation of the operation.
-  FailureOr<TilingResult>
-  getTiledImplementation(Operation *op, OpBuilder &b,
-                         ArrayRef<OpFoldResult> offsets,
-                         ArrayRef<OpFoldResult> sizes) const {
-    // Leave the `sizeBounds` value empty. That is only needed when the `sizes`
-    // specified could lead to out of bounds accesses.
+  /// Method to generate slices of the operands.
+  SmallVector<Value>
+  getOperandTilesForIterationDomainTile(Operation *op, OpBuilder &b,
+                                        ArrayRef<OpFoldResult> offsets,
+                                        ArrayRef<OpFoldResult> sizes) const {
     Location loc = op->getLoc();
     LinalgOp linalgOp = cast<LinalgOp>(op);
-    SmallVector<Value> valuesToTile = linalgOp->getOperands();
-    SmallVector<Value, 4> tiledOperands = makeTiledShapes(
-        b, loc, linalgOp, valuesToTile, offsets, sizes, {}, true);
+    return makeTiledShapes(b, loc, linalgOp, op->getOperands(), offsets, sizes,
+                           {}, true);
+  }
+
+  /// Instantiate the tiled implementation of the operation.
+  FailureOr<TilingResult> getTiledImplementation(
+      Operation *op, OpBuilder &b, ArrayRef<Value> tiledOperands,
+      ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes) const {
+    // Leave the `sizeBounds` value empty. That is only needed when the `sizes`
+    // specified could lead to out of bounds accesses.
+    LinalgOp linalgOp = cast<LinalgOp>(op);
 
     SmallVector<Type> resultTensorTypes =
         getTensorOutputTypes(linalgOp, tiledOperands);
@@ -235,9 +241,17 @@ struct LinalgOpTilingInterface
     SmallVector<OpFoldResult> mappedOffsets, mappedSizes;
     getMappedOffsetAndSize(linalgOp, b, indexingMap, offsets, sizes,
                            mappedOffsets, mappedSizes);
+
+    // Fetch the tiled slices of all operands.
     auto tilingInterfaceOp = cast<TilingInterface>(op);
+    SmallVector<Value> tiledOperands =
+        tilingInterfaceOp.getOperandTilesForIterationDomainTile(
+            b, mappedOffsets, mappedSizes);
+
+    // Fetch the tiled implementation of the op.
     FailureOr<TilingResult> tilingResult =
-        tilingInterfaceOp.getTiledImplementation(b, mappedOffsets, mappedSizes);
+        tilingInterfaceOp.getTiledImplementation(b, tiledOperands,
+                                                 mappedOffsets, mappedSizes);
 
     if (failed(tilingResult))
       return failure();

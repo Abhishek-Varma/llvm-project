@@ -2430,10 +2430,10 @@ SmallVector<utils::IteratorType> SoftmaxOp::getLoopIteratorTypes() {
   return iteratorTypes;
 }
 
-FailureOr<TilingResult>
-SoftmaxOp::getTiledImplementation(OpBuilder &builder,
-                                  ArrayRef<OpFoldResult> offsets,
-                                  ArrayRef<OpFoldResult> sizes) {
+SmallVector<Value>
+SoftmaxOp::getOperandTilesForIterationDomainTile(OpBuilder &builder,
+                                                 ArrayRef<OpFoldResult> offsets,
+                                                 ArrayRef<OpFoldResult> sizes) {
   int64_t rank = getInputOperandRank();
   auto oneAttr = builder.getI64IntegerAttr(1);
   SmallVector<OpFoldResult> strides(rank, oneAttr);
@@ -2442,7 +2442,12 @@ SoftmaxOp::getTiledImplementation(OpBuilder &builder,
       getSlice(builder, getLoc(), getInput(), offsets, sizes, strides));
   tiledOperands.emplace_back(
       getSlice(builder, getLoc(), getOutput(), offsets, sizes, strides));
+  return tiledOperands;
+}
 
+FailureOr<TilingResult> SoftmaxOp::getTiledImplementation(
+    OpBuilder &builder, ArrayRef<Value> tiledOperands,
+    ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes) {
   SmallVector<Type, 4> resultTypes;
   if (hasPureTensorSemantics())
     resultTypes.push_back(tiledOperands[1].getType());

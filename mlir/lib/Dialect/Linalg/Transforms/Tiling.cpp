@@ -415,9 +415,13 @@ static FailureOr<ForallTilingResult> tileToForallOpImpl(
     }
 
     // 4. Tile the cloned op and delete the clone.
+    auto tilingInterfaceOp = cast<TilingInterface>(clonedOp);
+    SmallVector<Value> tiledOperands =
+        tilingInterfaceOp.getOperandTilesForIterationDomainTile(b, tiledOffsets,
+                                                                tiledSizes);
     FailureOr<TilingResult> tilingResult =
-        cast<TilingInterface>(clonedOp).getTiledImplementation(b, tiledOffsets,
-                                                               tiledSizes);
+        tilingInterfaceOp.getTiledImplementation(b, tiledOperands, tiledOffsets,
+                                                 tiledSizes);
     if (failed(tilingResult))
       return clonedOp->emitError("Failed to tile op: ");
     if (tilingResult->tiledOps.size() != 1) {
@@ -766,9 +770,13 @@ FailureOr<linalg::ForallReductionTilingResult> linalg::tileReductionUsingForall(
 
     // 5. Tile the cloned op and delete the clone.
     if (tileSizes.empty()) {
-      FailureOr<TilingResult> tilingResult =
-          cast<TilingInterface>(clonedOp).getTiledImplementation(
+      auto tilingInterfaceOp = cast<TilingInterface>(clonedOp);
+      SmallVector<Value> tiledOperands =
+          tilingInterfaceOp.getOperandTilesForIterationDomainTile(
               b, tiledOffsets, tiledSizes);
+      FailureOr<TilingResult> tilingResult =
+          tilingInterfaceOp.getTiledImplementation(b, tiledOperands,
+                                                   tiledOffsets, tiledSizes);
       if (failed(tilingResult))
         return clonedOp->emitError("Failed to tile op: ");
       if (tilingResult->tiledOps.size() != 1) {

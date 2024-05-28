@@ -47,7 +47,8 @@ def TilingInterface : OpInterface<"TilingInterface"> {
       >,
       InterfaceMethod<
         /*desc=*/[{
-          Method to generate the tiled implementation of an operation.
+          Method to generate the tiled implementation of an operation given the
+          slices of its operands.
 
           The iteration space of the operation is returned by
           `getIterationDomain`. The caller provides the information of the
@@ -67,6 +68,7 @@ def TilingInterface : OpInterface<"TilingInterface"> {
         /*methodName=*/"getTiledImplementation",
         /*args=*/(ins
             "OpBuilder &":$b,
+            "ArrayRef<Value> ": $tiledOperands,
             "ArrayRef<OpFoldResult> ":$offsets,
             "ArrayRef<OpFoldResult> ":$sizes),
         /*methodBody=*/"",
@@ -152,6 +154,28 @@ def TilingInterface : OpInterface<"TilingInterface"> {
       >,
       InterfaceMethod<
         /*desc=*/[{
+          Method to generate slices of the operands.
+
+          - `offsets` provides the offset of the tile in the coordinate system
+            of the original coordinate space, i.e., if a dimension from the 
+            coordinate space of the operand has a non-zero offset, it must be
+            included in the offset provided here (as opposed to zero-based offset
+            "relative" to the coordinate space).
+          - `sizes` provides the size of the tile.
+        }],
+        /*retType=*/"SmallVector<Value>",
+        /*methodName=*/"getOperandTilesForIterationDomainTile",
+        /*args=*/(ins
+          "OpBuilder &":$b,
+          "ArrayRef<OpFoldResult>":$offsets,
+          "ArrayRef<OpFoldResult>":$sizes),
+        /*methodBody=*/"",
+        /*defaultImplementation=*/[{
+          return {};
+        }]
+      >,
+      InterfaceMethod<
+        /*desc=*/[{
           Method to generate the tiled implementation of an operation from
           operand tile position.
 
@@ -168,10 +192,10 @@ def TilingInterface : OpInterface<"TilingInterface"> {
           this implies it cannot be tiled and fused with its producers.
 
           - `offsets` provides the offset of the tile in the coordinate system
-            of the original iteration space, i.e., if an iteration space
-            dimension had non-zero offset, it must be included in the offset
-            provided here (as opposed to zero-based offset "relative" to the
-            iteration space).
+            of the original coordinate space, i.e., if a dimension from the 
+            coordinate space of the operand has a non-zero offset, it must be
+            included in the offset provided here (as opposed to zero-based offset
+            "relative" to the coordinate space).
           - `sizes` provides the size of the tile.
         }],
         /*retType=*/"FailureOr<::mlir::TilingResult>",
@@ -184,12 +208,15 @@ def TilingInterface : OpInterface<"TilingInterface"> {
         /*methodBody=*/"",
         /*defaultImplementation=*/[{
           ::llvm::SmallVector<OpFoldResult> mappedOffsets, mappedSizes;
-          auto tilingInterfaceOp = cast<::mlir::TilingInterface>($_op.getOperation());
+          Operation* op = $_op.getOperation();
+          auto tilingInterfaceOp = cast<::mlir::TilingInterface>(op);
           if (failed(tilingInterfaceOp.getIterationDomainTileFromOperandTile(
                   b, operandNumber, offsets, sizes, mappedOffsets, mappedSizes))) {
             return failure();
           }
-          return tilingInterfaceOp.getTiledImplementation(b, mappedOffsets, mappedSizes);
+          SmallVector<Value> tiledOperands = tilingInterfaceOp.getOperandTilesForIterationDomainTile(b, mappedOffsets, mappedSizes);
+          tiledOperands[operandNumber] = op->getOperand(operandNumber);
+          return tilingInterfaceOp.getTiledImplementation(b, tiledOperands, mappedOffsets, mappedSizes);
         }]
       >,
       InterfaceMethod<
