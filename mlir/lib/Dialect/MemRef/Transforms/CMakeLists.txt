@@ -10,6 +10,7 @@ add_mlir_dialect_library(MLIRMemRefTransforms
   ExtractAddressComputations.cpp
   FoldMemRefAliasOps.cpp
   IndependenceTransforms.cpp
+  LinearizeMemRefs.cpp
   MultiBuffer.cpp
   NormalizeMemRefs.cpp
   ResolveShapedTypeResultDims.cpp

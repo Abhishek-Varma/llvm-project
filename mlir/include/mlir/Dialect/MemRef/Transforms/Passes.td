@@ -28,6 +28,17 @@ def FoldMemRefAliasOps : Pass<"fold-memref-alias-ops"> {
   ];
 }
 
+def LinearizeMemRefs : Pass<"linearize-memrefs", "ModuleOp"> {
+  let summary = "Linearize memrefs";
+   let description = [{
+    TODO(avarma): Add proper description.
+    
+    This pass linearizes memref types.
+  }];
+  let constructor = "mlir::memref::createLinearizeMemRefsPass()";
+  let dependentDialects = ["affine::AffineDialect", "vector::VectorDialect"];
+}
+
 def MemRefEmulateWideInt : Pass<"memref-emulate-wide-int"> {
   let summary = "Emulate 2*N-bit integer operations using N-bit operations";
   let description = [{

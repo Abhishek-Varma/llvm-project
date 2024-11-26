@@ -53,6 +53,9 @@ std::unique_ptr<Pass> createExpandOpsPass();
 /// load/store ops into `patterns`.
 std::unique_ptr<Pass> createFoldMemRefAliasOpsPass();
 
+/// Creates an interprocedural pass to linearize memrefs.
+std::unique_ptr<OperationPass<ModuleOp>> createLinearizeMemRefsPass();
+
 /// Creates an interprocedural pass to normalize memrefs to have a trivial
 /// (identity) layout map.
 std::unique_ptr<OperationPass<ModuleOp>> createNormalizeMemRefsPass();
