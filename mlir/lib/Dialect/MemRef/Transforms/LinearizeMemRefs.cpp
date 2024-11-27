@@ -268,44 +268,6 @@ struct LinearizeMemrefCopy : public OpRewritePattern<memref::CopyOp> {
   }
 };
 
-struct LinearizeMemrefCollapse final
-    : public OpRewritePattern<memref::CollapseShapeOp> {
-  using OpRewritePattern<memref::CollapseShapeOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(memref::CollapseShapeOp collapseShapeOp,
-                                PatternRewriter &rewriter) const override {
-    Location loc = collapseShapeOp->getLoc();
-    MemRefType currentTypeOfSourceMemref =
-        dyn_cast<MemRefType>(collapseShapeOp.getSrc().getType());
-    ArrayAttr reassociationAttr = collapseShapeOp.getReassociation();
-
-    if (reassociationAttr.size() != 1)
-      return failure();
-    SmallVector<int64_t> integerArrayOfReassociation =
-        extractFromIntegerArrayAttr<int64_t>(reassociationAttr[0]);
-    if (!(std::is_sorted(integerArrayOfReassociation.begin(),
-                         integerArrayOfReassociation.end()) &&
-          integerArrayOfReassociation[0] == 0 &&
-          integerArrayOfReassociation[integerArrayOfReassociation.size() - 1] ==
-              integerArrayOfReassociation.size() - 1))
-      return failure();
-
-    MemRefType newTypeOfSourceMemref;
-    if (failed(getLinearizedTypeFromSourceType(currentTypeOfSourceMemref,
-                                               newTypeOfSourceMemref))) {
-      return failure();
-    }
-    if (currentTypeOfSourceMemref.getRank() < 2)
-      return success();
-
-    Value linearizedOperand = linearizeOperand(
-        loc, rewriter, collapseShapeOp.getSrc(), newTypeOfSourceMemref);
-    rewriter.replaceOp(collapseShapeOp, linearizedOperand);
-
-    return success();
-  }
-};
-
 struct LinearizeVectorLoad : public OpRewritePattern<vector::LoadOp> {
   using OpRewritePattern<vector::LoadOp>::OpRewritePattern;
 
@@ -387,7 +349,6 @@ void LinearizeMemRefs::runOnOperation() {
   patterns.add<LinearizeMemrefStore>(context);
   patterns.add<LinearizeMemrefDealloc>(context);
   patterns.add<LinearizeMemrefCopy>(context);
-  patterns.add<LinearizeMemrefCollapse>(context);
   patterns.add<LinearizeVectorLoad>(context);
   patterns.add<LinearizeVectorStore>(context);
 

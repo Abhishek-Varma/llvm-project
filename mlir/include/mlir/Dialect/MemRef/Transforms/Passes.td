@@ -36,7 +36,7 @@ def LinearizeMemRefs : Pass<"linearize-memrefs", "ModuleOp"> {
     This pass linearizes memref types.
   }];
   let constructor = "mlir::memref::createLinearizeMemRefsPass()";
-  let dependentDialects = ["affine::AffineDialect", "vector::VectorDialect"];
+  let dependentDialects = ["affine::AffineDialect", "memref::MemRefDialect", "vector::VectorDialect"];
 }
 
 def MemRefEmulateWideInt : Pass<"memref-emulate-wide-int"> {
