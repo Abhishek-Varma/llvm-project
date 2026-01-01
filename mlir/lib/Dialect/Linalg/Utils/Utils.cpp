@@ -373,11 +373,8 @@ static bool bodyMatcherForMaxSignedPoolOps(Value yieldVal, Block *body) {
                                                                   body);
 }
 
-// max_unsigned ops should not allow float data type.
-// TODO(#164800): Retire OPDSL logic.
 static bool bodyMatcherForMaxUnsignedPoolOps(Value yieldVal, Block *body) {
-  return bodyMatcherForPoolOps<arith::MaximumFOp, arith::MaxUIOp>(yieldVal,
-                                                                  body);
+  return bodyMatcherForPoolOps<arith::MaxUIOp>(yieldVal, body);
 }
 
 static bool bodyMatcherForMinSignedPoolOps(Value yieldVal, Block *body) {
@@ -385,11 +382,8 @@ static bool bodyMatcherForMinSignedPoolOps(Value yieldVal, Block *body) {
                                                                   body);
 }
 
-// min_unsigned ops should not allow float data type.
-// TODO(#164800): Retire OPDSL logic.
 static bool bodyMatcherForMinUnsignedPoolOps(Value yieldVal, Block *body) {
-  return bodyMatcherForPoolOps<arith::MinimumFOp, arith::MinUIOp>(yieldVal,
-                                                                  body);
+  return bodyMatcherForPoolOps<arith::MinUIOp>(yieldVal, body);
 }
 
 static bool bodyMatcherForSumPoolOps(Value yieldVal, Block *body) {
@@ -601,11 +595,15 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv1DOp>(LinalgOp op,
                                               SmallVector<int64_t> *dilations,
                                               SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv1DOp>(op))
+  if (isa<linalg::Conv1DOp>(op)) {
+    // Conv1DOp has no strides/dilations attributes, default to 1.
+    *dilations = SmallVector<int64_t>(1, 1);
+    *strides = SmallVector<int64_t>(1, 1);
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/1, dilations, strides);
   AffineExpr W = m.dim(0);
@@ -622,11 +620,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv1DNwcWcfOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv1DNwcWcfOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv1DNwcWcfOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/1, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -646,11 +647,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv1DNcwFcwOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv1DNcwFcwOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv1DNcwFcwOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/1, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -670,11 +674,15 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv2DOp>(LinalgOp op,
                                               SmallVector<int64_t> *dilations,
                                               SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv2DOp>(op))
+  if (isa<linalg::Conv2DOp>(op)) {
+    // Conv2DOp has no strides/dilations attributes, default to 1.
+    *dilations = SmallVector<int64_t>(2, 1);
+    *strides = SmallVector<int64_t>(2, 1);
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr H = m.dim(0);
@@ -694,11 +702,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv2DNhwcHwcfOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv2DNhwcHwcfOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv2DNhwcHwcfOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -721,11 +732,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv2DNhwcHwcfQOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv2DNhwcHwcfQOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv2DNhwcHwcfQOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -750,11 +764,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv2DNhwcFhwcOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv2DNhwcFhwcOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv2DNhwcFhwcOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -777,11 +794,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv2DNhwcFhwcQOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv2DNhwcFhwcQOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv2DNhwcFhwcQOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -806,11 +826,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv2DNchwFchwOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv2DNchwFchwOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv2DNchwFchwOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -833,11 +856,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv2DNchwFchwQOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv2DNchwFchwQOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv2DNchwFchwQOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -862,11 +888,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv2DNgchwFgchwOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv2DNgchwFgchwOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv2DNgchwFgchwOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -891,11 +920,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv2DNgchwGfchwOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv2DNgchwGfchwOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv2DNgchwGfchwOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -920,11 +952,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv2DNgchwGfchwQOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv2DNgchwGfchwQOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv2DNgchwGfchwQOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -951,11 +986,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv2DNhwgcGfhwcOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv2DNhwgcGfhwcOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv2DNhwgcGfhwcOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -980,11 +1018,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv2DNhwgcGfhwcQOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv2DNhwgcGfhwcQOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv2DNhwgcGfhwcQOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -1011,11 +1052,15 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv3DOp>(LinalgOp op,
                                               SmallVector<int64_t> *dilations,
                                               SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv3DOp>(op))
+  if (isa<linalg::Conv3DOp>(op)) {
+    // Conv3DOp has no strides/dilations attributes, default to 1.
+    *dilations = SmallVector<int64_t>(3, 1);
+    *strides = SmallVector<int64_t>(3, 1);
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/3, dilations, strides);
   AffineExpr D = m.dim(0);
@@ -1039,11 +1084,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv3DNdhwcDhwcfOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv3DNdhwcDhwcfOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv3DNdhwcDhwcfOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/3, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -1070,11 +1118,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv3DNdhwcDhwcfQOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv3DNdhwcDhwcfQOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv3DNdhwcDhwcfQOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/3, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -1103,11 +1154,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::Conv3DNcdhwFcdhwOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::Conv3DNcdhwFcdhwOp>(op))
+  if (auto convOp = dyn_cast<linalg::Conv3DNcdhwFcdhwOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/3, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -1134,11 +1188,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::DepthwiseConv1DNcwCwOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::DepthwiseConv1DNcwCwOp>(op))
+  if (auto convOp = dyn_cast<linalg::DepthwiseConv1DNcwCwOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/1, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -1157,11 +1214,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::DepthwiseConv1DNwcWcOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::DepthwiseConv1DNwcWcOp>(op))
+  if (auto convOp = dyn_cast<linalg::DepthwiseConv1DNwcWcOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/1, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -1180,11 +1240,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::DepthwiseConv1DNwcWcmOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::DepthwiseConv1DNwcWcmOp>(op))
+  if (auto convOp = dyn_cast<linalg::DepthwiseConv1DNwcWcmOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/1, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -1204,11 +1267,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::DepthwiseConv2DNchwChwOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::DepthwiseConv2DNchwChwOp>(op))
+  if (auto convOp = dyn_cast<linalg::DepthwiseConv2DNchwChwOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -1230,11 +1296,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::DepthwiseConv2DNhwcHwcOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::DepthwiseConv2DNhwcHwcOp>(op))
+  if (auto convOp = dyn_cast<linalg::DepthwiseConv2DNhwcHwcOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -1256,11 +1325,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::DepthwiseConv2DNhwcHwcQOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::DepthwiseConv2DNhwcHwcQOp>(op))
+  if (auto convOp = dyn_cast<linalg::DepthwiseConv2DNhwcHwcQOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -1284,11 +1356,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::DepthwiseConv2DNhwcHwcmOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::DepthwiseConv2DNhwcHwcmOp>(op))
+  if (auto convOp = dyn_cast<linalg::DepthwiseConv2DNhwcHwcmOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -1311,11 +1386,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::DepthwiseConv2DNhwcHwcmQOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::DepthwiseConv2DNhwcHwcmQOp>(op))
+  if (auto convOp = dyn_cast<linalg::DepthwiseConv2DNhwcHwcmQOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -1340,11 +1418,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::DepthwiseConv3DNdhwcDhwcOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::DepthwiseConv3DNdhwcDhwcOp>(op))
+  if (auto convOp = dyn_cast<linalg::DepthwiseConv3DNdhwcDhwcOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/3, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -1370,11 +1451,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::DepthwiseConv3DNcdhwCdhwOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::DepthwiseConv3DNcdhwCdhwOp>(op))
+  if (auto convOp = dyn_cast<linalg::DepthwiseConv3DNcdhwCdhwOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/3, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -1400,11 +1484,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::DepthwiseConv3DNdhwcDhwcmOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::DepthwiseConv3DNdhwcDhwcmOp>(op))
+  if (auto convOp = dyn_cast<linalg::DepthwiseConv3DNdhwcDhwcmOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(convOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(convOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/3, dilations, strides);
   AffineExpr N = m.dim(0);
@@ -1431,11 +1518,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNhwcMaxOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNhwcMaxOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNhwcMaxOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides,
                        PoolingType::MaxSigned);
@@ -1458,11 +1548,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNhwcMinOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNhwcMinOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNhwcMinOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides,
                        PoolingType::MinSigned);
@@ -1485,11 +1578,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNhwcSumOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNhwcSumOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNhwcSumOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides,
                        PoolingType::Sum);
@@ -1512,11 +1608,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNhwcMaxUnsignedOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNhwcMaxUnsignedOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNhwcMaxUnsignedOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides,
                        PoolingType::MaxUnsigned);
@@ -1539,11 +1638,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNhwcMinUnsignedOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNhwcMinUnsignedOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNhwcMinUnsignedOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides,
                        PoolingType::MinUnsigned);
@@ -1566,11 +1668,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNchwSumOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNchwSumOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNchwSumOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides,
                        PoolingType::Sum);
@@ -1593,11 +1698,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNchwMaxOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNchwMaxOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNchwMaxOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/2, dilations, strides,
                        PoolingType::MaxSigned);
@@ -1620,11 +1728,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNwcSumOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNwcSumOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNwcSumOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/1, dilations, strides,
                        PoolingType::Sum);
@@ -1644,11 +1755,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNcwSumOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNcwSumOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNcwSumOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/1, dilations, strides,
                        PoolingType::Sum);
@@ -1668,11 +1782,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNwcMaxOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNwcMaxOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNwcMaxOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/1, dilations, strides,
                        PoolingType::MaxSigned);
@@ -1692,11 +1809,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNwcMaxUnsignedOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNwcMaxUnsignedOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNwcMaxUnsignedOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/1, dilations, strides,
                        PoolingType::MaxUnsigned);
@@ -1716,11 +1836,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNcwMaxOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNcwMaxOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNcwMaxOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/1, dilations, strides,
                        PoolingType::MaxSigned);
@@ -1740,11 +1863,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNwcMinOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNwcMinOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNwcMinOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/1, dilations, strides,
                        PoolingType::MinSigned);
@@ -1764,11 +1890,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNwcMinUnsignedOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNwcMinUnsignedOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNwcMinUnsignedOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/1, dilations, strides,
                        PoolingType::MinUnsigned);
@@ -1788,11 +1917,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNdhwcSumOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNdhwcSumOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNdhwcSumOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/3, dilations, strides,
                        PoolingType::Sum);
@@ -1819,11 +1951,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNdhwcMaxOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNdhwcMaxOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNdhwcMaxOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/3, dilations, strides,
                        PoolingType::MaxSigned);
@@ -1850,11 +1985,14 @@ template <>
 bool isaConvolutionOpOfType<linalg::PoolingNdhwcMinOp>(
     LinalgOp op, SmallVector<int64_t> *dilations,
     SmallVector<int64_t> *strides) {
-  if (isa<linalg::PoolingNdhwcMinOp>(op))
+  if (auto poolOp = dyn_cast<linalg::PoolingNdhwcMinOp>(op.getOperation())) {
+    *dilations = llvm::to_vector(poolOp.getDilations().getValues<int64_t>());
+    *strides = llvm::to_vector(poolOp.getStrides().getValues<int64_t>());
     return true;
+  }
 
-  assert(isaConvolutionOpInterface(op) &&
-         "expected op to implement ConvolutionOpInterface");
+  if (!isaConvolutionOpInterface(op))
+    return false;
 
   ConvMatcherBuilder m(op, /*spatialRank=*/3, dilations, strides,
                        PoolingType::MinSigned);
