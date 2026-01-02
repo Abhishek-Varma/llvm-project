@@ -52,7 +52,62 @@ module attributes {transform.with_named_sequence} {
 // CHECK:           %[[SC_ADDI:.*]] = vector.shape_cast %[[ADDI]] : vector<1x24xi8> to vector<1x8x3xi8>
 // CHECK:           vector.transfer_write %[[SC_ADDI]], %[[OUTPUT]][%[[C0_IDX]], %[[C0_IDX]], %[[C0_IDX]]]
 
-//------
+// -----
+
+// Generic version of depthwise_conv_1d_nwc_wc with stride=1, dilation=1
+func.func @depthwise_conv1d_nwc_wc_1x8x3xi8_tensor_generic(%input: tensor<1x8x3xi8>,
+                                                           %filter: tensor<1x3xi8>,
+                                                           %output: tensor<1x8x3xi8>) -> (tensor<1x8x3xi8>) {
+  %res = linalg.generic {
+    indexing_maps = [
+      affine_map<(n, ow, c, kw) -> (n, ow + kw, c)>,
+      affine_map<(n, ow, c, kw) -> (kw, c)>,
+      affine_map<(n, ow, c, kw) -> (n, ow, c)>
+    ],
+    iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+  } ins(%input, %filter : tensor<1x8x3xi8>, tensor<1x3xi8>)
+    outs(%output : tensor<1x8x3xi8>) {
+  ^bb0(%in: i8, %flt: i8, %out: i8):
+    %mul = arith.muli %in, %flt : i8
+    %add = arith.addi %out, %mul : i8
+    linalg.yield %add : i8
+  } -> tensor<1x8x3xi8>
+  return %res : tensor<1x8x3xi8>
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.get_parent_op %0 {isolated_from_above} : (!transform.any_op) -> !transform.any_op
+    %2 = transform.structured.vectorize_children_and_apply_patterns %1 {flatten_1d_depthwise_conv} : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+
+// CHECK-LABEL:   func.func @depthwise_conv1d_nwc_wc_1x8x3xi8_tensor_generic
+// CHECK-SAME:      %[[INPUT:.*]]: tensor<1x8x3xi8>,
+// CHECK-SAME:      %[[FILTER:.*]]: tensor<1x3xi8>,
+// CHECK-SAME:      %[[OUTPUT:.*]]: tensor<1x8x3xi8>) -> tensor<1x8x3xi8> {
+
+// CHECK-DAG:       %[[C0_IDX:.*]] = arith.constant 0 : index
+
+/// Read the whole data in one shot.
+// CHECK:           vector.transfer_read %[[INPUT]]
+// CHECK:           vector.transfer_read %[[FILTER]]
+// CHECK:           vector.transfer_read %[[OUTPUT]]
+
+/// Check for flattened depthwise conv vectorization pattern
+// CHECK:           vector.shape_cast {{.*}} : vector<1x8x3xi8> to vector<1x24xi8>
+// CHECK:           vector.shuffle
+// CHECK:           vector.broadcast
+// CHECK:           arith.muli {{.*}} : vector<1x24xi8>
+// CHECK:           arith.addi {{.*}} : vector<1x24xi8>
+
+/// Write the result back.
+// CHECK:           vector.shape_cast {{.*}} : vector<1x24xi8> to vector<1x8x3xi8>
+// CHECK:           vector.transfer_write
+
+// -----
 
 func.func @depthwise_conv1d_nwc_wc_3x5x4xf32_memref_dillation_2(%input: memref<3x5x4xf32>,
                                                                 %filter: memref<2x4xf32>,
@@ -112,6 +167,60 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 }
+
+// -----
+
+// Generic version of depthwise_conv_1d_nwc_wc with stride=1, dilation=2 (f32)
+func.func @depthwise_conv1d_nwc_wc_3x5x4xf32_memref_dillation_2_generic(%input: memref<3x5x4xf32>,
+                                                                         %filter: memref<2x4xf32>,
+                                                                         %output: memref<3x2x4xf32>) {
+  // dilation=2 means: ow + 2*kw in the input indexing map
+  linalg.generic {
+    indexing_maps = [
+      affine_map<(n, ow, c, kw) -> (n, ow + 2*kw, c)>,
+      affine_map<(n, ow, c, kw) -> (kw, c)>,
+      affine_map<(n, ow, c, kw) -> (n, ow, c)>
+    ],
+    iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+  } ins(%input, %filter : memref<3x5x4xf32>, memref<2x4xf32>)
+    outs(%output : memref<3x2x4xf32>) {
+  ^bb0(%in: f32, %flt: f32, %out: f32):
+    %mul = arith.mulf %in, %flt : f32
+    %add = arith.addf %out, %mul : f32
+    linalg.yield %add : f32
+  }
+  return
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.get_parent_op %0 {isolated_from_above} : (!transform.any_op) -> !transform.any_op
+    %2 = transform.structured.vectorize_children_and_apply_patterns %1 {flatten_1d_depthwise_conv} : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+
+//       CHECK: func @depthwise_conv1d_nwc_wc_3x5x4xf32_memref_dillation_2_generic
+//  CHECK-SAME:   (%[[INPUT:[0-9a-z]+]]: memref<3x5x4xf32>, %[[FILTER:[0-9a-z]+]]: memref<2x4xf32>, %[[OUTPUT:[0-9a-z]+]]: memref<3x2x4xf32>)
+
+//   CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+
+/// Read the whole data in one shot.
+//      CHECK:   vector.transfer_read %[[INPUT]]
+//      CHECK:   vector.transfer_read %[[FILTER]]
+//      CHECK:   vector.transfer_read %[[OUTPUT]]
+
+/// Check for flattened depthwise conv vectorization pattern with dilation=2
+// CHECK:        vector.shape_cast {{.*}} : vector<3x2x4xf32> to vector<3x8xf32>
+// CHECK:        vector.shuffle
+// CHECK:        vector.broadcast
+// CHECK:        vector.fma {{.*}} : vector<3x8xf32>
+// CHECK:        vector.fma {{.*}} : vector<3x8xf32>
+
+/// Write the result back.
+// CHECK:        vector.shape_cast {{.*}} : vector<3x8xf32> to vector<3x2x4xf32>
+// CHECK:        vector.transfer_write {{.*}}, %[[OUTPUT]]
 
 // -----
 
@@ -176,6 +285,64 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 }
+
+// -----
+
+// Generic version of depthwise_conv_1d_nwc_wc with stride=1, dilation=2 (i8->i32)
+func.func @depthwise_conv1d_nwc_wc_3x5x4xi8_memref_dilation_2_generic(%input: memref<3x5x4xi8>,
+                                                                       %filter: memref<2x4xi8>,
+                                                                       %output: memref<3x2x4xi32>) {
+  // dilation=2 means: ow + 2*kw in the input indexing map
+  linalg.generic {
+    indexing_maps = [
+      affine_map<(n, ow, c, kw) -> (n, ow + 2*kw, c)>,
+      affine_map<(n, ow, c, kw) -> (kw, c)>,
+      affine_map<(n, ow, c, kw) -> (n, ow, c)>
+    ],
+    iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+  } ins(%input, %filter : memref<3x5x4xi8>, memref<2x4xi8>)
+    outs(%output : memref<3x2x4xi32>) {
+  ^bb0(%in: i8, %flt: i8, %out: i32):
+    %in_ext = arith.extsi %in : i8 to i32
+    %flt_ext = arith.extsi %flt : i8 to i32
+    %mul = arith.muli %in_ext, %flt_ext : i32
+    %add = arith.addi %out, %mul : i32
+    linalg.yield %add : i32
+  }
+  return
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.get_parent_op %0 {isolated_from_above} : (!transform.any_op) -> !transform.any_op
+    %2 = transform.structured.vectorize_children_and_apply_patterns %1 {flatten_1d_depthwise_conv} : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+
+//       CHECK: func @depthwise_conv1d_nwc_wc_3x5x4xi8_memref_dilation_2_generic
+//  CHECK-SAME:   (%[[INPUT:[0-9a-z]+]]: memref<3x5x4xi8>, %[[FILTER:[0-9a-z]+]]: memref<2x4xi8>, %[[OUTPUT:[0-9a-z]+]]: memref<3x2x4xi32>)
+
+//   CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+
+/// Read the whole data in one shot.
+//      CHECK:   vector.transfer_read %[[INPUT]]
+//      CHECK:   vector.transfer_read %[[FILTER]]
+//      CHECK:   vector.transfer_read %[[OUTPUT]]
+
+/// Check for flattened depthwise conv vectorization pattern with dilation=2 and i8->i32 extension
+// CHECK:        vector.shape_cast
+// CHECK:        arith.extsi {{.*}} : vector<3x8xi8> to vector<3x8xi32>
+// CHECK:        vector.shuffle
+// CHECK:        arith.extsi
+// CHECK:        vector.broadcast
+// CHECK:        arith.muli {{.*}} : vector<3x8xi32>
+// CHECK:        arith.addi {{.*}} : vector<3x8xi32>
+
+/// Write the result back.
+// CHECK:        vector.shape_cast {{.*}} : vector<3x8xi32> to vector<3x2x4xi32>
+// CHECK:        vector.transfer_write {{.*}}, %[[OUTPUT]]
 
 // -----
 
@@ -309,3 +476,57 @@ module attributes {transform.with_named_sequence} {
   }
 }
 
+// -----
+
+// Test that generic ops with depthwise conv semantics work with flattening.
+// Generic version of depthwise_conv_1d_nwc_wc with stride=2, dilation=1
+
+func.func @depthwise_conv1d_nwc_wc_generic_flatten(%input: tensor<3x9x4xi8>,
+                                                    %filter: tensor<3x4xi8>,
+                                                    %output: tensor<3x3x4xi8>) -> tensor<3x3x4xi8> {
+  %res = linalg.generic {
+    indexing_maps = [
+      affine_map<(n, ow, c, kw) -> (n, ow * 2 + kw, c)>,  // input (stride=2, dilation=1)
+      affine_map<(n, ow, c, kw) -> (kw, c)>,              // filter
+      affine_map<(n, ow, c, kw) -> (n, ow, c)>            // output
+    ],
+    iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+  } ins(%input, %filter : tensor<3x9x4xi8>, tensor<3x4xi8>)
+    outs(%output : tensor<3x3x4xi8>) {
+  ^bb0(%in: i8, %flt: i8, %out: i8):
+    %mul = arith.muli %in, %flt : i8
+    %add = arith.addi %out, %mul : i8
+    linalg.yield %add : i8
+  } -> tensor<3x3x4xi8>
+  return %res : tensor<3x3x4xi8>
+}
+
+// CHECK-LABEL:   func.func @depthwise_conv1d_nwc_wc_generic_flatten
+// CHECK-SAME:      %[[INPUT:.*]]: tensor<3x9x4xi8>,
+// CHECK-SAME:      %[[FILTER:.*]]: tensor<3x4xi8>,
+// CHECK-SAME:      %[[OUTPUT:.*]]: tensor<3x3x4xi8>) -> tensor<3x3x4xi8> {
+
+// CHECK-DAG:       %[[C0_IDX:.*]] = arith.constant 0 : index
+
+/// Read the whole data in one shot.
+// CHECK:           vector.transfer_read %[[INPUT]]
+// CHECK:           vector.transfer_read %[[FILTER]]
+// CHECK:           vector.transfer_read %[[OUTPUT]]
+
+/// Check for depthwise conv vectorization pattern (shape_cast + broadcast + muli + addi)
+// CHECK:           vector.shape_cast
+// CHECK:           vector.broadcast
+// CHECK:           arith.muli
+// CHECK:           arith.addi
+
+/// Write the result back.
+// CHECK:           vector.transfer_write
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.get_parent_op %0 {isolated_from_above} : (!transform.any_op) -> !transform.any_op
+    %2 = transform.structured.vectorize_children_and_apply_patterns %1 {flatten_1d_depthwise_conv} : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}

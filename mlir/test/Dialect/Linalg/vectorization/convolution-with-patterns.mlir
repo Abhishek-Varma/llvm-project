@@ -1213,3 +1213,201 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 }
+
+// -----
+
+// Test that generic ops with convolution semantics are vectorized.
+// This is a generic version of conv_1d_nwc_wcf with non-trivial stride:
+// Input: (N=4, IW=6, C=3), Filter: (KW=1, C=3, F=8), Output: (N=4, OW=2, F=8)
+// strides=3, dilations=1 (matching the first named conv test)
+
+func.func @conv1d_nwc_generic(%input: memref<4x6x3xf32>, %filter: memref<1x3x8xf32>, %output: memref<4x2x8xf32>) {
+  linalg.generic {
+    indexing_maps = [
+      affine_map<(n, ow, f, kw, c) -> (n, ow * 3 + kw, c)>,  // input (stride=3, dilation=1)
+      affine_map<(n, ow, f, kw, c) -> (kw, c, f)>,           // filter
+      affine_map<(n, ow, f, kw, c) -> (n, ow, f)>            // output
+    ],
+    iterator_types = ["parallel", "parallel", "parallel", "reduction", "reduction"]
+  } ins(%input, %filter : memref<4x6x3xf32>, memref<1x3x8xf32>)
+    outs(%output : memref<4x2x8xf32>) {
+  ^bb0(%in: f32, %flt: f32, %out: f32):
+    %mul = arith.mulf %in, %flt : f32
+    %add = arith.addf %out, %mul : f32
+    linalg.yield %add : f32
+  }
+  return
+}
+
+// CHECK-LABEL: func @conv1d_nwc_generic
+// CHECK-SAME: (%[[INPUT:.+]]: memref<4x6x3xf32>, %[[FILTER:.+]]: memref<1x3x8xf32>, %[[OUTPUT:.+]]: memref<4x2x8xf32>)
+
+//  CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+//  CHECK-DAG:   %[[F0:.+]] = arith.constant 0.000000e+00 : f32
+
+/// Read the whole data in one shot.
+//  CHECK-DAG:   vector.transfer_read %[[INPUT]][%[[C0]], %[[C0]], %[[C0]]], %[[F0]]
+//  CHECK-DAG:   vector.transfer_read %[[FILTER]][%[[C0]], %[[C0]], %[[C0]]], %[[F0]]
+//  CHECK-DAG:   vector.transfer_read %[[OUTPUT]][%[[C0]], %[[C0]], %[[C0]]], %[[F0]]
+
+/// Check for vector.contract operation (convolution vectorized with stride=3)
+//      CHECK:   vector.contract
+
+/// Write the result back in one shot.
+//      CHECK:   vector.transfer_write {{.*}}, %[[OUTPUT]][%[[C0]], %[[C0]], %[[C0]]]
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.get_parent_op %0 {isolated_from_above} : (!transform.any_op) -> !transform.any_op
+    %2 = transform.structured.vectorize_children_and_apply_patterns %1 : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+// Test that generic ops with depthwise convolution semantics are vectorized.
+// This is a generic version of depthwise_conv_1d_nwc_wc with non-trivial dilation:
+// Input: (N=3, IW=5, C=4), Filter: (KW=2, C=4), Output: (N=3, OW=2, C=4)
+// strides=1, dilations=2 (matching the named depthwise conv test)
+
+func.func @depthwise_conv1d_nwc_wc_generic(%input: memref<3x5x4xf32>, %filter: memref<2x4xf32>, %output: memref<3x2x4xf32>) {
+  linalg.generic {
+    indexing_maps = [
+      affine_map<(n, ow, c, kw) -> (n, ow + kw * 2, c)>,  // input (stride=1, dilation=2)
+      affine_map<(n, ow, c, kw) -> (kw, c)>,              // filter
+      affine_map<(n, ow, c, kw) -> (n, ow, c)>            // output
+    ],
+    iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+  } ins(%input, %filter : memref<3x5x4xf32>, memref<2x4xf32>)
+    outs(%output : memref<3x2x4xf32>) {
+  ^bb0(%in: f32, %flt: f32, %out: f32):
+    %mul = arith.mulf %in, %flt : f32
+    %add = arith.addf %out, %mul : f32
+    linalg.yield %add : f32
+  }
+  return
+}
+
+// CHECK-LABEL: func @depthwise_conv1d_nwc_wc_generic
+// CHECK-SAME: (%[[INPUT:.+]]: memref<3x5x4xf32>, %[[FILTER:.+]]: memref<2x4xf32>, %[[OUTPUT:.+]]: memref<3x2x4xf32>)
+
+//  CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+//  CHECK-DAG:   %[[F0:.+]] = arith.constant 0.000000e+00 : f32
+
+/// Read the whole data in one shot.
+//  CHECK-DAG:   vector.transfer_read %[[INPUT]][%[[C0]], %[[C0]], %[[C0]]], %[[F0]]
+//  CHECK-DAG:   vector.transfer_read %[[FILTER]][%[[C0]], %[[C0]]], %[[F0]]
+//  CHECK-DAG:   vector.transfer_read %[[OUTPUT]][%[[C0]], %[[C0]], %[[C0]]], %[[F0]]
+
+/// Check for vector.fma operation (depthwise conv vectorized with dilation=2)
+//      CHECK:   vector.fma
+
+/// Write the result back in one shot.
+//      CHECK:   vector.transfer_write {{.*}}, %[[OUTPUT]][%[[C0]], %[[C0]], %[[C0]]]
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.get_parent_op %0 {isolated_from_above} : (!transform.any_op) -> !transform.any_op
+    %2 = transform.structured.vectorize_children_and_apply_patterns %1 : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+// Test that generic ops with pooling_nwc_sum semantics are vectorized.
+// Generic version of pooling_nwc_sum with stride=3, dilation=1
+// Input: (N=4, IW=4, C=3), Filter: (KW=1), Output: (N=4, OW=2, C=3)
+
+func.func @pooling_nwc_sum_generic(%input: memref<4x4x3xf32>, %filter: memref<1xf32>, %output: memref<4x2x3xf32>) {
+  linalg.generic {
+    indexing_maps = [
+      affine_map<(n, ow, c, kw) -> (n, ow * 3 + kw, c)>,  // input (stride=3, dilation=1)
+      affine_map<(n, ow, c, kw) -> (kw)>,                  // filter (window shape)
+      affine_map<(n, ow, c, kw) -> (n, ow, c)>             // output
+    ],
+    iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+  } ins(%input, %filter : memref<4x4x3xf32>, memref<1xf32>)
+    outs(%output : memref<4x2x3xf32>) {
+  ^bb0(%in: f32, %flt: f32, %out: f32):
+    %add = arith.addf %out, %in : f32
+    linalg.yield %add : f32
+  }
+  return
+}
+
+// CHECK-LABEL: func @pooling_nwc_sum_generic
+// CHECK-SAME: (%[[INPUT:.+]]: memref<4x4x3xf32>, %[[FILTER:.+]]: memref<1xf32>, %[[OUTPUT:.+]]: memref<4x2x3xf32>)
+
+//  CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+//  CHECK-DAG:   %[[F0:.+]] = arith.constant 0.000000e+00 : f32
+
+/// Read the whole data in one shot.
+//  CHECK-DAG:   vector.transfer_read %[[INPUT]][%[[C0]], %[[C0]], %[[C0]]], %[[F0]]
+//  CHECK-DAG:   vector.transfer_read %[[OUTPUT]][%[[C0]], %[[C0]], %[[C0]]], %[[F0]]
+
+/// Check for arith.addf operation (sum pooling)
+//      CHECK:   arith.addf
+
+/// Write the result back in one shot.
+//      CHECK:   vector.transfer_write {{.*}}, %[[OUTPUT]][%[[C0]], %[[C0]], %[[C0]]]
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.get_parent_op %0 {isolated_from_above} : (!transform.any_op) -> !transform.any_op
+    %2 = transform.structured.vectorize_children_and_apply_patterns %1 : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+// Test that generic ops with pooling_nwc_max semantics are vectorized.
+// Generic version of pooling_nwc_max with stride=3, dilation=1
+// Input: (N=4, IW=4, C=3), Filter: (KW=1), Output: (N=4, OW=2, C=3)
+
+func.func @pooling_nwc_max_generic(%input: memref<4x4x3xf32>, %filter: memref<1xf32>, %output: memref<4x2x3xf32>) {
+  linalg.generic {
+    indexing_maps = [
+      affine_map<(n, ow, c, kw) -> (n, ow * 3 + kw, c)>,  // input (stride=3, dilation=1)
+      affine_map<(n, ow, c, kw) -> (kw)>,                  // filter (window shape)
+      affine_map<(n, ow, c, kw) -> (n, ow, c)>             // output
+    ],
+    iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+  } ins(%input, %filter : memref<4x4x3xf32>, memref<1xf32>)
+    outs(%output : memref<4x2x3xf32>) {
+  ^bb0(%in: f32, %flt: f32, %out: f32):
+    %max = arith.maximumf %out, %in : f32
+    linalg.yield %max : f32
+  }
+  return
+}
+
+// CHECK-LABEL: func @pooling_nwc_max_generic
+// CHECK-SAME: (%[[INPUT:.+]]: memref<4x4x3xf32>, %[[FILTER:.+]]: memref<1xf32>, %[[OUTPUT:.+]]: memref<4x2x3xf32>)
+
+//  CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+//  CHECK-DAG:   %[[F0:.+]] = arith.constant 0.000000e+00 : f32
+
+/// Read the whole data in one shot.
+//  CHECK-DAG:   vector.transfer_read %[[INPUT]][%[[C0]], %[[C0]], %[[C0]]], %[[F0]]
+//  CHECK-DAG:   vector.transfer_read %[[OUTPUT]][%[[C0]], %[[C0]], %[[C0]]], %[[F0]]
+
+/// Check for arith.maximumf operation (max pooling)
+//      CHECK:   arith.maximumf
+
+/// Write the result back in one shot.
+//      CHECK:   vector.transfer_write {{.*}}, %[[OUTPUT]][%[[C0]], %[[C0]], %[[C0]]]
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.get_parent_op %0 {isolated_from_above} : (!transform.any_op) -> !transform.any_op
+    %2 = transform.structured.vectorize_children_and_apply_patterns %1 : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}

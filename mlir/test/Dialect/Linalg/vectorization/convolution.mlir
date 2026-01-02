@@ -70,6 +70,54 @@ module attributes {transform.with_named_sequence} {
 
 // -----
 
+// Generic version of depthwise_conv_1d_nwc_wc with dynamic channel dim.
+func.func @depthwise_conv1d_nwc_wc_1x8x3xi8_tensor_generic(%input: tensor<1x8x?xi8>,
+                                                           %filter: tensor<1x?xi8>,
+                                                           %output: tensor<1x8x?xi8>) -> (tensor<1x8x?xi8>) {
+  %res = linalg.generic {
+    indexing_maps = [
+      affine_map<(n, ow, c, kw) -> (n, ow + kw, c)>,
+      affine_map<(n, ow, c, kw) -> (kw, c)>,
+      affine_map<(n, ow, c, kw) -> (n, ow, c)>
+    ],
+    iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+  } ins(%input, %filter : tensor<1x8x?xi8>, tensor<1x?xi8>)
+    outs(%output : tensor<1x8x?xi8>) {
+  ^bb0(%in: i8, %flt: i8, %out: i8):
+    %mul = arith.muli %in, %flt : i8
+    %add = arith.addi %out, %mul : i8
+    linalg.yield %add : i8
+  } -> tensor<1x8x?xi8>
+  return %res : tensor<1x8x?xi8>
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    transform.structured.vectorize %0 vector_sizes [1, 8, 4, 1] : !transform.any_op
+    transform.yield
+  }
+}
+
+// CHECK-LABEL:   func.func @depthwise_conv1d_nwc_wc_1x8x3xi8_tensor_generic(
+// CHECK-SAME:      %[[INPUT:.*]]: tensor<1x8x?xi8>,
+// CHECK-SAME:      %[[FILTER:.*]]: tensor<1x?xi8>,
+// CHECK-SAME:      %[[OUTPUT:.*]]: tensor<1x8x?xi8>) -> tensor<1x8x?xi8> {
+
+/// Same vectorized output as named op version
+// CHECK:           vector.create_mask {{.*}} : vector<1x8x4xi1>
+// CHECK:           vector.mask {{.*}} { vector.transfer_read %[[INPUT]]{{.*}} } : vector<1x8x4xi1> -> vector<1x8x4xi8>
+// CHECK:           vector.create_mask {{.*}} : vector<1x4xi1>
+// CHECK:           vector.mask {{.*}} { vector.transfer_read %[[FILTER]]{{.*}} } : vector<1x4xi1> -> vector<1x4xi8>
+// CHECK:           vector.create_mask {{.*}} : vector<1x8x4xi1>
+// CHECK:           vector.mask {{.*}} { vector.transfer_read %[[OUTPUT]]{{.*}} } : vector<1x8x4xi1> -> vector<1x8x4xi8>
+// CHECK:           vector.broadcast {{.*}} : vector<4xi8> to vector<1x8x4xi8>
+// CHECK:           arith.muli {{.*}} : vector<1x8x4xi8>
+// CHECK:           arith.addi {{.*}} : vector<1x8x4xi8>
+// CHECK:           vector.mask {{.*}} { vector.transfer_write {{.*}} } : vector<1x8x4xi1> -> tensor<1x8x?xi8>
+
+// -----
+
 func.func @depthwise_conv1d_nwc_wc_1x8x3xi8_tensor_scalable(
       %input: tensor<1x8x?xi8>,
       %filter: tensor<1x?xi8>,
@@ -129,6 +177,55 @@ module attributes {transform.with_named_sequence} {
 // CHECK:           %[[OUT_INS:.*]] = vector.insert_strided_slice %[[ADDI]], %[[VEC_OUT]] {offsets = [0, 0, 0], strides = [1, 1, 1]} : vector<1x8x[4]xi8> into vector<1x8x[4]xi8>
 // CHECK:           %[[OUT:.*]] = vector.mask %[[MASK_OUT]] { vector.transfer_write %[[OUT_INS]], %[[OUTPUT]]{{\[}}%[[C0]], %[[C0]], %[[C0]]] {in_bounds = [true, true, true]} : vector<1x8x[4]xi8>, tensor<1x8x?xi8> } : vector<1x8x[4]xi1> -> tensor<1x8x?xi8>
 // CHECK:           return %[[OUT]] : tensor<1x8x?xi8>
+
+// -----
+
+// Generic version with scalable vectors.
+func.func @depthwise_conv1d_nwc_wc_1x8x3xi8_tensor_scalable_generic(
+      %input: tensor<1x8x?xi8>,
+      %filter: tensor<1x?xi8>,
+      %output: tensor<1x8x?xi8>) -> (tensor<1x8x?xi8>) {
+  %res = linalg.generic {
+    indexing_maps = [
+      affine_map<(n, ow, c, kw) -> (n, ow + kw, c)>,
+      affine_map<(n, ow, c, kw) -> (kw, c)>,
+      affine_map<(n, ow, c, kw) -> (n, ow, c)>
+    ],
+    iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+  } ins(%input, %filter : tensor<1x8x?xi8>, tensor<1x?xi8>)
+    outs(%output : tensor<1x8x?xi8>) {
+  ^bb0(%in: i8, %flt: i8, %out: i8):
+    %mul = arith.muli %in, %flt : i8
+    %add = arith.addi %out, %mul : i8
+    linalg.yield %add : i8
+  } -> tensor<1x8x?xi8>
+  return %res : tensor<1x8x?xi8>
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    transform.structured.vectorize %0 vector_sizes [1, 8, [4], 1] : !transform.any_op
+    transform.yield
+  }
+}
+
+// CHECK-LABEL:   func.func @depthwise_conv1d_nwc_wc_1x8x3xi8_tensor_scalable_generic(
+// CHECK-SAME:      %[[INPUT:.*]]: tensor<1x8x?xi8>,
+// CHECK-SAME:      %[[FILTER:.*]]: tensor<1x?xi8>,
+// CHECK-SAME:      %[[OUTPUT:.*]]: tensor<1x8x?xi8>) -> tensor<1x8x?xi8> {
+
+/// Same scalable vectorized output as named op version
+// CHECK:           vector.create_mask {{.*}} : vector<1x8x[4]xi1>
+// CHECK:           vector.mask {{.*}} { vector.transfer_read %[[INPUT]]{{.*}} } : vector<1x8x[4]xi1> -> vector<1x8x[4]xi8>
+// CHECK:           vector.create_mask {{.*}} : vector<1x[4]xi1>
+// CHECK:           vector.mask {{.*}} { vector.transfer_read %[[FILTER]]{{.*}} } : vector<1x[4]xi1> -> vector<1x[4]xi8>
+// CHECK:           vector.create_mask {{.*}} : vector<1x8x[4]xi1>
+// CHECK:           vector.mask {{.*}} { vector.transfer_read %[[OUTPUT]]{{.*}} } : vector<1x8x[4]xi1> -> vector<1x8x[4]xi8>
+// CHECK:           vector.broadcast {{.*}} : vector<[4]xi8> to vector<1x8x[4]xi8>
+// CHECK:           arith.muli {{.*}} : vector<1x8x[4]xi8>
+// CHECK:           arith.addi {{.*}} : vector<1x8x[4]xi8>
+// CHECK:           vector.mask {{.*}} { vector.transfer_write {{.*}} } : vector<1x8x[4]xi1> -> tensor<1x8x?xi8>
 
 // -----
 
@@ -193,3 +290,53 @@ module attributes {transform.with_named_sequence} {
 // CHECK:           %[[FMA_2:.*]] = vector.fma %[[IN_2]], %[[FLT_2_B]], %[[FMA_1]] : vector<3x2x[4]xf32>
 // CHECK:           %[[OUT_INS:.*]] = vector.insert_strided_slice %[[FMA_2]], %[[VEC_OUT]] {offsets = [0, 0, 0], strides = [1, 1, 1]} : vector<3x2x[4]xf32> into vector<3x2x[4]xf32>
 // CHECK:           vector.mask %[[MASK_OUT]] { vector.transfer_write %[[OUT_INS]], %[[OUTPUT]]{{\[}}%[[C0]], %[[C0]], %[[C0]]] {in_bounds = [true, true, true]} : vector<3x2x[4]xf32>, memref<3x2x?xf32> } : vector<3x2x[4]xi1>
+
+// -----
+
+// Generic version with dilation=2.
+func.func @depthwise_conv1d_nwc_wc_3x5x4xf32_memref_dilation_2_generic(
+      %input: memref<3x5x?xf32>,
+      %filter: memref<2x?xf32>,
+      %output: memref<3x2x?xf32>) {
+  // dilation=2 means: ow + 2*kw in the input indexing map
+  linalg.generic {
+    indexing_maps = [
+      affine_map<(n, ow, c, kw) -> (n, ow + 2*kw, c)>,
+      affine_map<(n, ow, c, kw) -> (kw, c)>,
+      affine_map<(n, ow, c, kw) -> (n, ow, c)>
+    ],
+    iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+  } ins(%input, %filter : memref<3x5x?xf32>, memref<2x?xf32>)
+    outs(%output : memref<3x2x?xf32>) {
+  ^bb0(%in: f32, %flt: f32, %out: f32):
+    %mul = arith.mulf %in, %flt : f32
+    %add = arith.addf %out, %mul : f32
+    linalg.yield %add : f32
+  }
+  return
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    transform.structured.vectorize %0 vector_sizes [3, 2, [4], 2] : !transform.any_op
+    transform.yield
+  }
+}
+
+// CHECK-LABEL:   func.func @depthwise_conv1d_nwc_wc_3x5x4xf32_memref_dilation_2_generic(
+// CHECK-SAME:      %[[INPUT:.*]]: memref<3x5x?xf32>,
+// CHECK-SAME:      %[[FILTER:.*]]: memref<2x?xf32>,
+// CHECK-SAME:      %[[OUTPUT:.*]]: memref<3x2x?xf32>) {
+
+/// Same vectorized output as named op version with dilation=2
+// CHECK:           vector.create_mask {{.*}} : vector<3x4x[4]xi1>
+// CHECK:           vector.mask {{.*}} { vector.transfer_read %[[INPUT]]{{.*}} } : vector<3x4x[4]xi1> -> vector<3x4x[4]xf32>
+// CHECK:           vector.create_mask {{.*}} : vector<2x[4]xi1>
+// CHECK:           vector.mask {{.*}} { vector.transfer_read %[[FILTER]]{{.*}} } : vector<2x[4]xi1> -> vector<2x[4]xf32>
+// CHECK:           vector.create_mask {{.*}} : vector<3x2x[4]xi1>
+// CHECK:           vector.mask {{.*}} { vector.transfer_read %[[OUTPUT]]{{.*}} } : vector<3x2x[4]xi1> -> vector<3x2x[4]xf32>
+/// Two FMAs for dilation=2 (kw=2)
+// CHECK:           vector.fma {{.*}} : vector<3x2x[4]xf32>
+// CHECK:           vector.fma {{.*}} : vector<3x2x[4]xf32>
+// CHECK:           vector.mask {{.*}} { vector.transfer_write {{.*}} } : vector<3x2x[4]xi1>
