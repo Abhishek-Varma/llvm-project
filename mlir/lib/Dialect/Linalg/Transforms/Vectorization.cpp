@@ -611,6 +611,83 @@ enum class Conv1DOpOrder {
   Nwc  // Corresponds to operation that traverses the input in (n, w, c) order.
 };
 
+/// Struct to hold generic convolution parameters detected via
+/// inferConvolutionDims. This enables vectorization of generalized
+/// convolutions that may or may not have a batch dimension.
+struct GenericConvParams {
+  int64_t strideW;
+  int64_t dilationW;
+  Conv1DOpOrder order;
+  bool hasBatch;
+};
+
+/// Determine the Conv1DOpOrder from ConvolutionDimensions by analyzing
+/// the position of spatial and channel dimensions in the output map.
+/// Returns the order and whether the operation has a batch dimension.
+static std::optional<std::pair<Conv1DOpOrder, bool>>
+getConv1DOrderFromDims(LinalgOp op, const ConvolutionDimensions &dims) {
+  if (dims.outputImage.size() != 1 || dims.filterLoop.size() != 1)
+    return std::nullopt;
+  bool hasBatch = !dims.batch.empty();
+  // Non-channeled convolution (W order): no input/output channels.
+  if (dims.inputChannel.empty() && dims.outputChannel.empty() &&
+      dims.depth.empty())
+    return std::make_pair(Conv1DOpOrder::W, false);
+  // For channeled convolutions, determine if channel-first or channel-last
+  // by checking the relative positions in the output map.
+  AffineMap outputMap = op.getMatchingIndexingMap(op.getDpsInitOperand(0));
+  ArrayRef<AffineExpr> outputResults = outputMap.getResults();
+  // Find position of spatial (outputImage) dim in output.
+  unsigned spatialLoopIdx = dims.outputImage[0];
+  int spatialPosInOutput = -1;
+  for (int i = 0, e = outputResults.size(); i < e; ++i) {
+    if (auto dimExpr = dyn_cast<AffineDimExpr>(outputResults[i])) {
+      if (dimExpr.getPosition() == spatialLoopIdx) {
+        spatialPosInOutput = i;
+        break;
+      }
+    }
+  }
+  // Find position of channel dim in output (either outputChannel or depth).
+  unsigned channelLoopIdx = !dims.outputChannel.empty() ? dims.outputChannel[0]
+                            : !dims.depth.empty()       ? dims.depth[0]
+                                                        : spatialLoopIdx;
+  int channelPosInOutput = -1;
+  for (int i = 0, e = outputResults.size(); i < e; ++i) {
+    if (auto dimExpr = dyn_cast<AffineDimExpr>(outputResults[i])) {
+      if (dimExpr.getPosition() == channelLoopIdx) {
+        channelPosInOutput = i;
+        break;
+      }
+    }
+  }
+  if (spatialPosInOutput < 0 || channelPosInOutput < 0)
+    return std::nullopt;
+  if (spatialPosInOutput < channelPosInOutput)
+    return std::make_pair(Conv1DOpOrder::Nwc, hasBatch);
+  return std::make_pair(Conv1DOpOrder::Ncw, hasBatch);
+}
+
+/// Try to match a generic 1D convolution/pooling using inferConvolutionDims.
+/// This allows vectorization of linalg.generic ops that have convolution
+/// semantics but may have been generalized (e.g., batch dimension stripped).
+static std::optional<GenericConvParams>
+matchGeneric1DConvPoolOp(LinalgOp op) {
+  auto maybeDims = inferConvolutionDims(op);
+  if (failed(maybeDims))
+    return std::nullopt;
+  // Only 1D convolutions are supported.
+  if (maybeDims->outputImage.size() != 1 || maybeDims->filterLoop.size() != 1)
+    return std::nullopt;
+  auto orderAndBatch = getConv1DOrderFromDims(op, *maybeDims);
+  if (!orderAndBatch)
+    return std::nullopt;
+  if (maybeDims->strides.empty() || maybeDims->dilations.empty())
+    return std::nullopt;
+  return GenericConvParams{maybeDims->strides[0], maybeDims->dilations[0],
+                           orderAndBatch->first, orderAndBatch->second};
+}
+
 /// Helper data structure to represent the result of vectorization for a single
 /// operation. In certain specific cases, like terminators, we do not want to
 /// propagate.
@@ -2367,11 +2444,17 @@ static LogicalResult vectorizeConvOpPrecondition(linalg::LinalgOp convOp) {
   ShapedType lhsShapedType = getOperandType(convOp.getDpsInputOperand(0));
   ShapedType rhsShapedType = getOperandType(convOp.getDpsInputOperand(1));
   ShapedType resShapedType = getOperandType(convOp.getDpsInitOperand(0));
-  // (LHS has dimension NCW/NWC and RES has dimension NFW/NCW/NWF/NWC) OR
-  // (non-channeled convolution -> LHS and RHS both have single dimensions).
-  // Note that this also ensures 2D and 3D convolutions are rejected.
-  if ((lhsShapedType.getRank() != 3 || resShapedType.getRank() != 3) &&
-      (lhsShapedType.getRank() != 1 || resShapedType.getRank() != 1))
+  // Supported rank combinations for 1D convolutions:
+  // - Rank 3 for LHS/RES: batched channeled conv (NWC/NCW)
+  // - Rank 2 for LHS/RES: batch-less channeled conv (WC/CW) - generalized form
+  // - Rank 1 for LHS/RES: non-channeled conv (W)
+  // Note that this also ensures 2D and 3D spatial convolutions are rejected.
+  int64_t lhsRank = lhsShapedType.getRank();
+  int64_t resRank = resShapedType.getRank();
+  bool isValidRank = (lhsRank == 3 && resRank == 3) || // Batched channeled
+                     (lhsRank == 2 && resRank == 2) || // Batch-less channeled
+                     (lhsRank == 1 && resRank == 1);   // Non-channeled
+  if (!isValidRank)
     return failure();
 
   Operation *reduceOp = matchLinalgReduction(convOp.getDpsInitOperand(0));
@@ -3579,19 +3662,36 @@ struct Conv1DGenerator
     // Try to match a 1D conv/pool op using matchConvolutionOpOfType. This
     // works for both named ops and generic ops that match their semantics.
     std::optional<DilationsAndStrides> convParams = match1DConvPoolOp(linalgOp);
-    if (!convParams)
-      return failure();
+    if (convParams) {
+      int strideW = static_cast<int>(convParams->strides.front());
+      int dilationW = static_cast<int>(convParams->dilations.front());
+      return Conv1DGenerator(rewriter, linalgOp, strideW, dilationW,
+                             /*hasBatch=*/true,
+                             /*genericConvOrder=*/std::nullopt);
+    }
 
-    int strideW = static_cast<int>(convParams->strides.front());
-    int dilationW = static_cast<int>(convParams->dilations.front());
-    return Conv1DGenerator(rewriter, linalgOp, strideW, dilationW);
+    // If named op matching fails, try generic convolution matching.
+    // This enables vectorization of linalg.generic ops with convolution
+    // semantics, including those with stripped batch dimensions.
+    std::optional<GenericConvParams> genericParams =
+        matchGeneric1DConvPoolOp(linalgOp);
+    if (genericParams) {
+      return Conv1DGenerator(rewriter, linalgOp,
+                             static_cast<int>(genericParams->strideW),
+                             static_cast<int>(genericParams->dilationW),
+                             genericParams->hasBatch, genericParams->order);
+    }
+
+    return failure();
   }
 
 private:
   Conv1DGenerator(RewriterBase &rewriter, LinalgOp linalgOp, int strideW,
-                  int dilationW)
+                  int dilationW, bool hasBatch,
+                  std::optional<Conv1DOpOrder> genericConvOrder)
       : StructuredGenerator<LinalgOp, utils::IteratorType>(rewriter, linalgOp),
-        strideW(strideW), dilationW(dilationW) {
+        strideW(strideW), dilationW(dilationW), hasBatch(hasBatch),
+        genericConvOrder(genericConvOrder) {
 
     lhsShaped = linalgOp.getDpsInputOperand(0)->get();
     rhsShaped = linalgOp.getDpsInputOperand(1)->get();
@@ -3632,6 +3732,15 @@ public:
     int64_t nSize, wSize, cSize, kwSize, fSize;
     SmallVector<int64_t, 3> lhsShape, rhsShape, resShape;
     bool isSingleChanneled = (conv1DOpOrder == Conv1DOpOrder::W);
+
+    // Helper to compute input width from output width
+    auto computeInputWidth = [&](int64_t outW, int64_t kw) {
+      // iw = ow * sw + kw * dw - 1
+      // (i.e. 16 convolved with 3 (@stride 1 dilation 1) -> 14)
+      // Perform the proper inclusive -> exclusive -> inclusive.
+      return ((outW - 1) * strideW + 1) + ((kw - 1) * dilationW + 1) - 1;
+    };
+
     switch (conv1DOpOrder) {
     case Conv1DOpOrder::W:
       // Initialize unused dimensions
@@ -3647,8 +3756,15 @@ public:
       resShape = {wSize};
       break;
     case Conv1DOpOrder::Nwc:
-      // out{n, w, f}
-      bindShapeDims(resShapedType, nSize, wSize, fSize);
+      // Handle both batched {n, w, f} and batch-less {w, f} cases
+      if (hasBatch) {
+        // out{n, w, f}
+        bindShapeDims(resShapedType, nSize, wSize, fSize);
+      } else {
+        // out{w, f} - batch-less (generalized) case
+        nSize = 1;
+        bindShapeDims(resShapedType, wSize, fSize);
+      }
       switch (oper) {
       case ConvOperationKind::Conv:
         // kernel{kw, c, f}
@@ -3660,13 +3776,15 @@ public:
         cSize = fSize;
         break;
       }
-      lhsShape = {nSize,
-                  // iw = ow * sw + kw *  dw - 1
-                  //   (i.e. 16 convolved with 3 (@stride 1 dilation 1) -> 14)
-                  // Perform the proper inclusive -> exclusive -> inclusive.
-                  ((wSize - 1) * strideW + 1) + ((kwSize - 1) * dilationW + 1) -
-                      1,
-                  cSize};
+      if (hasBatch) {
+        lhsShape = {nSize, computeInputWidth(wSize, kwSize), cSize};
+        resShape = {nSize, wSize, fSize};
+      } else {
+        // Batch-less: shapes are 2D but we treat as 3D with n=1 for
+        // vectorization
+        lhsShape = {1, computeInputWidth(wSize, kwSize), cSize};
+        resShape = {1, wSize, fSize};
+      }
       switch (oper) {
       case ConvOperationKind::Conv:
         rhsShape = {kwSize, cSize, fSize};
@@ -3675,11 +3793,17 @@ public:
         rhsShape = {kwSize};
         break;
       }
-      resShape = {nSize, wSize, fSize};
       break;
     case Conv1DOpOrder::Ncw:
-      // out{n, f, w}
-      bindShapeDims(resShapedType, nSize, fSize, wSize);
+      // Handle both batched {n, f, w} and batch-less {f, w} cases
+      if (hasBatch) {
+        // out{n, f, w}
+        bindShapeDims(resShapedType, nSize, fSize, wSize);
+      } else {
+        // out{f, w} - batch-less (generalized) case
+        nSize = 1;
+        bindShapeDims(resShapedType, fSize, wSize);
+      }
       switch (oper) {
       case ConvOperationKind::Conv:
         // kernel{f, c, kw}
@@ -3691,12 +3815,15 @@ public:
         cSize = fSize;
         break;
       }
-      lhsShape = {nSize, cSize,
-                  // iw = ow * sw + kw *  dw - 1
-                  //   (i.e. 16 convolved with 3 (@stride 1 dilation 1) -> 14)
-                  // Perform the proper inclusive -> exclusive -> inclusive.
-                  ((wSize - 1) * strideW + 1) + ((kwSize - 1) * dilationW + 1) -
-                      1};
+      if (hasBatch) {
+        lhsShape = {nSize, cSize, computeInputWidth(wSize, kwSize)};
+        resShape = {nSize, fSize, wSize};
+      } else {
+        // Batch-less: shapes are 2D but we treat as 3D with n=1 for
+        // vectorization
+        lhsShape = {1, cSize, computeInputWidth(wSize, kwSize)};
+        resShape = {1, fSize, wSize};
+      }
       switch (oper) {
       case ConvOperationKind::Conv:
         rhsShape = {fSize, cSize, kwSize};
@@ -3705,7 +3832,6 @@ public:
         rhsShape = {kwSize};
         break;
       }
-      resShape = {nSize, fSize, wSize};
       break;
     }
 
@@ -3720,17 +3846,37 @@ public:
     Type lhsEltType = lhsShapedType.getElementType();
     Type rhsEltType = rhsShapedType.getElementType();
     Type resEltType = resShapedType.getElementType();
+
+    // For batch-less cases, we need to handle the shape mismatch:
+    // - Actual tensors are 2D (no batch dim)
+    // - We want to vectorize as 3D (with batch=1)
+    // Strategy: read actual shapes, then expand to 3D for computation
+    SmallVector<int64_t, 3> actualLhsShape, actualResShape;
+    if (!hasBatch && !isSingleChanneled) {
+      // Actual tensor shapes are 2D (without batch)
+      actualLhsShape = SmallVector<int64_t, 3>(lhsShape.begin() + 1,
+                                               lhsShape.end());
+      actualResShape = SmallVector<int64_t, 3>(resShape.begin() + 1,
+                                               resShape.end());
+    } else {
+      actualLhsShape = SmallVector<int64_t, 3>(lhsShape);
+      actualResShape = SmallVector<int64_t, 3>(resShape);
+    }
+
     auto lhsType = VectorType::get(lhsShape, lhsEltType);
     auto rhsType = VectorType::get(rhsShape, rhsEltType);
     auto resType = VectorType::get(resShape, resEltType);
+    auto actualLhsType = VectorType::get(actualLhsShape, lhsEltType);
+    auto actualResType = VectorType::get(actualResShape, resEltType);
+
     // Zero padding with the corresponding dimensions for lhs, rhs and res.
-    SmallVector<Value> lhsPadding(lhsShape.size(), zero);
+    SmallVector<Value> lhsPadding(actualLhsShape.size(), zero);
     SmallVector<Value> rhsPadding(rhsShape.size(), zero);
-    SmallVector<Value> resPadding(resShape.size(), zero);
+    SmallVector<Value> resPadding(actualResShape.size(), zero);
 
     // Read the whole lhs, rhs and res in one shot (with zero padding).
     Value lhs = vector::TransferReadOp::create(
-        rewriter, loc, lhsType, lhsShaped, lhsPadding,
+        rewriter, loc, actualLhsType, lhsShaped, lhsPadding,
         /*padding=*/arith::getZeroConstant(rewriter, loc, lhsEltType));
     // This is needed only for Conv.
     Value rhs = nullptr;
@@ -3739,8 +3885,14 @@ public:
           rewriter, loc, rhsType, rhsShaped, rhsPadding,
           /*padding=*/arith::getZeroConstant(rewriter, loc, rhsEltType));
     Value res = vector::TransferReadOp::create(
-        rewriter, loc, resType, resShaped, resPadding,
+        rewriter, loc, actualResType, resShaped, resPadding,
         /*padding=*/arith::getZeroConstant(rewriter, loc, resEltType));
+
+    // For batch-less cases, expand vectors to 3D by adding batch dim of 1
+    if (!hasBatch && !isSingleChanneled) {
+      lhs = vector::ShapeCastOp::create(rewriter, loc, lhsType, lhs);
+      res = vector::ShapeCastOp::create(rewriter, loc, resType, res);
+    }
 
     // The base vectorization case for channeled convolution is input:
     // {n,w,c}, weight: {kw,c,f}, output: {n,w,f}. To reuse the base pattern
@@ -3831,6 +3983,11 @@ public:
       res = vector::TransposeOp::create(rewriter, loc, res, perm);
       break;
     }
+    }
+
+    // For batch-less cases, collapse result back to 2D before writing
+    if (!hasBatch && !isSingleChanneled) {
+      res = vector::ShapeCastOp::create(rewriter, loc, actualResType, res);
     }
 
     return vector::TransferWriteOp::create(rewriter, loc, res, resShaped,
@@ -4242,6 +4399,45 @@ public:
     return rewriter.notifyMatchFailure(op, "not a pooling::Ncw layout");
   }
 
+  /// Entry point for generic convolutions detected via inferConvolutionDims.
+  /// This handles convolutions that may have been generalized (e.g., batch
+  /// dimension stripped by IREE's DispatchCreation). The order (Nwc/Ncw) is
+  /// determined during matching and stored in genericConvOrder.
+  FailureOr<Operation *> generateGenericConv() {
+    // This method should only be called when genericConvOrder is set
+    if (!genericConvOrder)
+      return rewriter.notifyMatchFailure(
+          op, "not a generic convolution (no order detected)");
+
+    Conv1DOpOrder order = *genericConvOrder;
+
+    // For non-channeled convolutions
+    if (order == Conv1DOpOrder::W) {
+      return conv(Conv1DOpOrder::W);
+    }
+
+    // For channeled convolutions, we directly use the detected order.
+    // The conv() method handles both batched and non-batched cases based on
+    // the actual tensor shapes.
+    return conv(order);
+  }
+
+  /// Entry point for generic pooling detected via inferConvolutionDims.
+  /// Similar to generateGenericConv but for pooling operations.
+  FailureOr<Operation *> generateGenericPooling() {
+    // This method should only be called when genericConvOrder is set
+    if (!genericConvOrder)
+      return rewriter.notifyMatchFailure(
+          op, "not a generic pooling (no order detected)");
+
+    // Pooling must have Pool operation kind
+    if (oper != ConvOperationKind::Pool)
+      return rewriter.notifyMatchFailure(op, "not a pooling operation");
+
+    Conv1DOpOrder order = *genericConvOrder;
+    return conv(order);
+  }
+
   /// Entry point that transposes into the common form:
   ///   {{n, strideW * w + dilationW * kw, c}, {kw, c}, {n, w, c}}
   FailureOr<Operation *> generateDilatedConv(uint64_t vecChDimSize = 0,
@@ -4271,6 +4467,12 @@ private:
   Value lhsShaped, rhsShaped, resShaped;
   ShapedType lhsShapedType, rhsShapedType, resShapedType;
   vector::CombiningKind reductionKind;
+  // Indicates whether the operation has a batch dimension.
+  // When false, the operation is a generalized convolution with batch stripped.
+  bool hasBatch = true;
+  // When set, indicates this is a generalized convolution matched via
+  // inferConvolutionDims, and the order determined from dimension analysis.
+  std::optional<Conv1DOpOrder> genericConvOrder = std::nullopt;
 
   // Sets oper, poolExtOp and isPoolExt for valid conv/pooling ops.
   void setConvOperationKind(Operation *reduceOp) {
@@ -4308,6 +4510,8 @@ static FailureOr<Operation *> vectorizeConvolution(
   FailureOr<Conv1DGenerator> conv1dGen = Conv1DGenerator::create(rewriter, op);
   if (failed(conv1dGen))
     return failure();
+
+  // Try standard named op patterns first
   auto res = conv1dGen->generateNonChanneledConv();
   if (succeeded(res))
     return res;
@@ -4324,6 +4528,15 @@ static FailureOr<Operation *> vectorizeConvolution(
   if (succeeded(res))
     return res;
 
+  // Try generic convolution/pooling patterns for generalized ops
+  // (e.g., linalg.generic with convolution semantics, possibly batch-less)
+  res = conv1dGen->generateGenericConv();
+  if (succeeded(res))
+    return res;
+  res = conv1dGen->generateGenericPooling();
+  if (succeeded(res))
+    return res;
+
   // Only depthwise 1D NWC convs are left - these can be vectorized using masks
   // and scalable vectors. Note that ATM the only dim that can be dynamic (i.e.
   // masked/scalable) is the channel dim (i.e. the trailing dim).
@@ -4332,17 +4545,17 @@ static FailureOr<Operation *> vectorizeConvolution(
   if (!inputVecSizes.empty()) {
     // Only use the input vector size corresponding to the channel dim. Other
     // vector dims will be inferred from the Ops.
-    assert((isaConvolutionOpOfType<linalg::DepthwiseConv1DNwcWcOp>(op) ||
-            isaConvolutionOpOfType<linalg::DepthwiseConv1DNcwCwOp>(op)) &&
-           "Not a 1D depthwise conv!");
-    size_t chDimIdx = 0;
-    if (isaConvolutionOpOfType<linalg::DepthwiseConv1DNwcWcOp>(op))
-      chDimIdx = 2;
-    if (isaConvolutionOpOfType<linalg::DepthwiseConv1DNcwCwOp>(op))
-      chDimIdx = 1;
+    if (isaConvolutionOpOfType<linalg::DepthwiseConv1DNwcWcOp>(op) ||
+        isaConvolutionOpOfType<linalg::DepthwiseConv1DNcwCwOp>(op)) {
+      size_t chDimIdx = 0;
+      if (isaConvolutionOpOfType<linalg::DepthwiseConv1DNwcWcOp>(op))
+        chDimIdx = 2;
+      if (isaConvolutionOpOfType<linalg::DepthwiseConv1DNcwCwOp>(op))
+        chDimIdx = 1;
 
-    vecChDimSize = inputVecSizes[chDimIdx];
-    vecChDimScalableFlag = inputScalableVecDims[chDimIdx];
+      vecChDimSize = inputVecSizes[chDimIdx];
+      vecChDimScalableFlag = inputScalableVecDims[chDimIdx];
+    }
   }
   return conv1dGen->generateDilatedConv(vecChDimSize, vecChDimScalableFlag,
                                         flatten1DDepthwiseConv);
