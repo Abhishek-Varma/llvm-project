@@ -126,16 +126,20 @@ extractConvInputSlices(RewriterBase &rewriter, Location loc, Value input,
       }
     }
   } else {
-    // Extract lhs slice of size {n, wSizeStep, c} @ [0, sw * w + dw * kw, 0]
-    // for channeled convolution.
-    SmallVector<int64_t> sizes = {nSize, wSizeStep, cSize};
-    SmallVector<int64_t> strides = {1, 1, 1};
+    // Channeled: slice {n?, wSizeStep, c} @ [0?, sw*w + dw*kw, 0]. Batch and
+    // batchless differ only by leading batch dim in sizes/offsets.
+    bool hasBatch = (nSize > 0);
+    SmallVector<int64_t> sizes =
+        hasBatch ? SmallVector<int64_t>{nSize, wSizeStep, cSize}
+                 : SmallVector<int64_t>{wSizeStep, cSize};
+    SmallVector<int64_t> strides(hasBatch ? 3 : 2, 1);
     for (int64_t kw = 0; kw < kwSize; ++kw) {
       for (int64_t w = 0; w < wSize; w += wSizeStep) {
+        SmallVector<int64_t> offsets =
+            hasBatch ? SmallVector<int64_t>{0, w * strideW + kw * dilationW, 0}
+                     : SmallVector<int64_t>{w * strideW + kw * dilationW, 0};
         result.push_back(vector::ExtractStridedSliceOp::create(
-            rewriter, loc, input,
-            /*offsets=*/ArrayRef<int64_t>{0, w * strideW + kw * dilationW, 0},
-            sizes, strides));
+            rewriter, loc, input, offsets, sizes, strides));
       }
     }
   }
@@ -174,28 +178,31 @@ extractConvResultSlices(RewriterBase &rewriter, Location loc, Value res,
           strides));
     }
   } else {
-    // Extract res slice: {n, wSizeStep, f} @ [0, w, 0] for channeled
-    // convolution.
-    SmallVector<int64_t> sizes = {nSize, wSizeStep, fSize};
-    SmallVector<int64_t> strides = {1, 1, 1};
+    // Channeled: {n?, wSizeStep, f} @ [0?, w, 0]. Batch and batchless differ
+    // only by leading batch dim in sizes/offsets.
+    bool hasBatch = (nSize > 0);
+    SmallVector<int64_t> sizes =
+        hasBatch ? SmallVector<int64_t>{nSize, wSizeStep, fSize}
+                 : SmallVector<int64_t>{wSizeStep, fSize};
+    SmallVector<int64_t> strides(hasBatch ? 3 : 2, 1);
     for (int64_t w = 0; w < wSize; w += wSizeStep) {
+      SmallVector<int64_t> offsets =
+          hasBatch ? SmallVector<int64_t>{0, w, 0} : SmallVector<int64_t>{w, 0};
       result.push_back(vector::ExtractStridedSliceOp::create(
-          rewriter, loc, res, /*offsets=*/ArrayRef<int64_t>{0, w, 0}, sizes,
-          strides));
+          rewriter, loc, res, offsets, sizes, strides));
     }
   }
   return result;
 }
 
 /// Helper function to insert the computed result slices.
+/// For channeled ops, \p hasBatchChanneled is true when result has a batch dim.
 static Value insertConvResultSlices(RewriterBase &rewriter, Location loc,
                                     Value res, int64_t wSize, int64_t wSizeStep,
                                     SmallVectorImpl<Value> &resVals,
-                                    bool isSingleChanneled) {
-
+                                    bool isSingleChanneled,
+                                    bool hasBatchChanneled = true) {
   if (isSingleChanneled) {
-    // Write back res slice: {wSizeStep} @ [w] for non-channeled convolution.
-    // This does not depend on kw.
     SmallVector<int64_t> strides = {1};
     for (int64_t w = 0; w < wSize; w += wSizeStep) {
       res = vector::InsertStridedSliceOp::create(
@@ -203,13 +210,16 @@ static Value insertConvResultSlices(RewriterBase &rewriter, Location loc,
           strides);
     }
   } else {
-    // Write back res slice: {n, wSizeStep, f} @ [0, w, 0] for channeled
-    // convolution. This does not depend on kw.
-    SmallVector<int64_t> strides = {1, 1, 1};
+    // Channeled: write back {n?, wSizeStep, f} @ [0?, w, 0]. Same loop for
+    // batch and batchless; only strides/offsets differ.
+    int rank = hasBatchChanneled ? 3 : 2;
+    SmallVector<int64_t> strides(rank, 1);
     for (int64_t w = 0; w < wSize; w += wSizeStep) {
-      res = vector::InsertStridedSliceOp::create(
-          rewriter, loc, resVals[w], res,
-          /*offsets=*/ArrayRef<int64_t>{0, w, 0}, strides);
+      SmallVector<int64_t> offsets = hasBatchChanneled
+                                         ? SmallVector<int64_t>{0, w, 0}
+                                         : SmallVector<int64_t>{w, 0};
+      res = vector::InsertStridedSliceOp::create(rewriter, loc, resVals[w], res,
+                                                 offsets, strides);
     }
   }
   return res;
@@ -604,11 +614,17 @@ static AffineMap reindexIndexingMap(AffineMap map) {
   return res;
 }
 
-/// Helper enum to represent conv1d input traversal order.
+/// Helper enum to represent conv1d layout. Batch vs batchless is encoded in
+/// the enum; conv() uses a single code path per layout (Nwc / Ncw) and derives
+/// hasBatch from the order.
 enum class Conv1DOpOrder {
-  W,   // Corresponds to non-channeled 1D convolution operation.
-  Ncw, // Corresponds to operation that traverses the input in (n, c, w) order.
-  Nwc  // Corresponds to operation that traverses the input in (n, w, c) order.
+  W,
+  Nwc,
+  Ncw,
+  NwcBatchless,
+  NcwBatchless,
+  NwcPoolingBatchless,
+  NcwPoolingBatchless
 };
 
 /// Helper data structure to represent the result of vectorization for a single
@@ -2079,6 +2095,17 @@ static LogicalResult reductionPreconditions(LinalgOp op) {
   return success();
 }
 
+/// Returns convolution dimensions if the op is a depthwise conv (convolution
+/// with non-empty depth); failure otherwise. Works for both named conv ops and
+/// generics with conv-like indexing maps (e.g. after generalize-named-ops).
+static FailureOr<ConvolutionDimensions>
+getDepthwiseConvDims(linalg::LinalgOp op) {
+  FailureOr<ConvolutionDimensions> convDims = inferConvolutionDims(op);
+  if (failed(convDims) || convDims->depth.empty())
+    return failure();
+  return convDims;
+}
+
 static LogicalResult
 vectorizeDynamicConvOpPrecondition(linalg::LinalgOp conv,
                                    bool flatten1DDepthwiseConv) {
@@ -2088,20 +2115,27 @@ vectorizeDynamicConvOpPrecondition(linalg::LinalgOp conv,
     return failure();
   }
 
-  if (!isaConvolutionOpOfType<linalg::DepthwiseConv1DNwcWcOp>(conv)) {
-    LDBG() << "Not a 1D depth-wise WC conv, dynamic shapes are not supported";
+  FailureOr<ConvolutionDimensions> convDims = getDepthwiseConvDims(conv);
+  if (failed(convDims)) {
+    LDBG() << "Not a depthwise conv (no depth dim), dynamic shapes are not "
+              "supported";
     return failure();
   }
 
-  // Support dynamic shapes in 1D depthwise convolution, but only in the
-  // _channel_ dimension.
+  // Support dynamic shapes only in the depth/channel dimension (any layout).
+  // Depthwise always has that dimension in the LHS.
   Value lhs = conv.getDpsInputOperand(0)->get();
   ArrayRef<int64_t> lhsShape = cast<ShapedType>(lhs.getType()).getShape();
-  auto shapeWithoutCh = lhsShape.drop_back(1);
-  if (ShapedType::isDynamicShape(shapeWithoutCh)) {
-    LDBG() << "Dynamically-shaped op vectorization precondition failed: only "
-              "channel dim can be dynamic";
-    return failure();
+  AffineMap lhsMap = conv.getMatchingIndexingMap(conv.getDpsInputOperand(0));
+  AffineExpr depthExpr =
+      getAffineDimExpr(convDims->depth.front(), conv.getContext());
+  for (unsigned i = 0; i < lhsShape.size(); ++i) {
+    if (lhsMap.getResult(i) != depthExpr &&
+        ShapedType::isDynamic(lhsShape[i])) {
+      LDBG() << "Dynamically-shaped op vectorization precondition failed: only "
+                "channel (depth) dim can be dynamic";
+      return failure();
+    }
   }
 
   return success();
@@ -2368,9 +2402,11 @@ static LogicalResult vectorizeConvOpPrecondition(linalg::LinalgOp convOp) {
   ShapedType rhsShapedType = getOperandType(convOp.getDpsInputOperand(1));
   ShapedType resShapedType = getOperandType(convOp.getDpsInitOperand(0));
   // (LHS has dimension NCW/NWC and RES has dimension NFW/NCW/NWF/NWC) OR
+  // (batchless channeled -> LHS and RES both rank 2, e.g. (w,c)/(w,f)) OR
   // (non-channeled convolution -> LHS and RHS both have single dimensions).
   // Note that this also ensures 2D and 3D convolutions are rejected.
   if ((lhsShapedType.getRank() != 3 || resShapedType.getRank() != 3) &&
+      (lhsShapedType.getRank() != 2 || resShapedType.getRank() != 2) &&
       (lhsShapedType.getRank() != 1 || resShapedType.getRank() != 1))
     return failure();
 
@@ -2664,12 +2700,12 @@ vectorizeScalableVectorPrecondition(Operation *op,
 
   // Cond 4: Only the following ops are supported in the
   // presence of scalable vectors
-  return success(
-      isElementwise(linalgOp) || isa<linalg::MatmulOp>(op) ||
-      isa<linalg::BatchMatmulOp>(op) ||
-      isaConvolutionOpOfType<linalg::DepthwiseConv1DNwcWcOp>(linalgOp) ||
-      isa<linalg::MatvecOp>(op) || isa<linalg::Mmt4DOp>(op) ||
-      isa<linalg::BatchMmt4DOp>(op) || hasReductionIterator(linalgOp));
+  return success(isElementwise(linalgOp) || isa<linalg::MatmulOp>(op) ||
+                 isa<linalg::BatchMatmulOp>(op) ||
+                 succeeded(getDepthwiseConvDims(linalgOp)) ||
+                 isa<linalg::MatvecOp>(op) || isa<linalg::Mmt4DOp>(op) ||
+                 isa<linalg::BatchMmt4DOp>(op) ||
+                 hasReductionIterator(linalgOp));
 }
 
 LogicalResult mlir::linalg::vectorizeOpPrecondition(
@@ -3504,35 +3540,22 @@ static void bindShapeDims(ShapedType shapedType, IntTy &...vals) {
   bindShapeDims<0>(shapedType, vals...);
 }
 
-/// Match 1D convolution or pooling operations and return their dilations and
-/// strides. Returns std::nullopt for unrecognized ops.
-static std::optional<DilationsAndStrides> match1DConvPoolOp(LinalgOp op) {
-#define MATCH_1D_CONV_POOL_OP(ConvOpTy)                                        \
-  if (auto convParams = matchConvolutionOpOfType<ConvOpTy>(op))                \
-    return convParams;
-
-  // 1D Convolution ops.
-  MATCH_1D_CONV_POOL_OP(linalg::Conv1DOp);
-  MATCH_1D_CONV_POOL_OP(linalg::Conv1DNwcWcfOp);
-  MATCH_1D_CONV_POOL_OP(linalg::Conv1DNcwFcwOp);
-  // Depthwise 1D Convolution ops.
-  // Note: Only NWC layout without channel multiplier is supported.
-  // DepthwiseConv1DNcwCwOp (NCW) and DepthwiseConv1DNwcWcmOp (with multiplier)
-  // are not supported.
-  MATCH_1D_CONV_POOL_OP(linalg::DepthwiseConv1DNwcWcOp);
-  // 1D Pooling ops (NWC layout).
-  MATCH_1D_CONV_POOL_OP(linalg::PoolingNwcSumOp);
-  MATCH_1D_CONV_POOL_OP(linalg::PoolingNwcMaxOp);
-  MATCH_1D_CONV_POOL_OP(linalg::PoolingNwcMaxUnsignedOp);
-  MATCH_1D_CONV_POOL_OP(linalg::PoolingNwcMinOp);
-  MATCH_1D_CONV_POOL_OP(linalg::PoolingNwcMinUnsignedOp);
-  // 1D Pooling ops (NCW layout).
-  MATCH_1D_CONV_POOL_OP(linalg::PoolingNcwSumOp);
-  MATCH_1D_CONV_POOL_OP(linalg::PoolingNcwMaxOp);
-
-#undef MATCH_1D_CONV_POOL_OP
-
-  return std::nullopt;
+/// Get 1D convolution strides and dilations using inferConvolutionDims.
+/// Returns DilationsAndStrides when the op has exactly one output-image and one
+/// filter-loop dimension (1D conv/pool), so that generic and batchless convs
+/// can be vectorized without matching a named op type.
+static std::optional<DilationsAndStrides>
+getDilationsAndStridesFromConvDims(LinalgOp op) {
+  FailureOr<ConvolutionDimensions> convDims = inferConvolutionDims(op);
+  if (failed(convDims))
+    return std::nullopt;
+  if (convDims->outputImage.size() != 1 || convDims->filterLoop.size() != 1)
+    return std::nullopt;
+  DilationsAndStrides result;
+  result.strides.assign(convDims->strides.begin(), convDims->strides.end());
+  result.dilations.assign(convDims->dilations.begin(),
+                          convDims->dilations.end());
+  return result;
 }
 
 namespace {
@@ -3573,12 +3596,12 @@ namespace {
 struct Conv1DGenerator
     : public StructuredGenerator<LinalgOp, utils::IteratorType> {
   /// Factory method to create a Conv1DGenerator. Returns failure if the
-  /// operation doesn't have valid strides/dilations.
+  /// operation doesn't have valid strides/dilations. Uses inferConvolutionDims
+  /// so both named and generic 1D conv/pool ops are supported.
   static FailureOr<Conv1DGenerator> create(RewriterBase &rewriter,
                                            LinalgOp linalgOp) {
-    // Try to match a 1D conv/pool op using matchConvolutionOpOfType. This
-    // works for both named ops and generic ops that match their semantics.
-    std::optional<DilationsAndStrides> convParams = match1DConvPoolOp(linalgOp);
+    std::optional<DilationsAndStrides> convParams =
+        getDilationsAndStridesFromConvDims(linalgOp);
     if (!convParams)
       return failure();
 
@@ -3647,66 +3670,73 @@ public:
       resShape = {wSize};
       break;
     case Conv1DOpOrder::Nwc:
-      // out{n, w, f}
-      bindShapeDims(resShapedType, nSize, wSize, fSize);
-      switch (oper) {
-      case ConvOperationKind::Conv:
-        // kernel{kw, c, f}
-        bindShapeDims(rhsShapedType, kwSize, cSize);
-        break;
-      case ConvOperationKind::Pool:
-        // kernel{kw}
-        bindShapeDims(rhsShapedType, kwSize);
-        cSize = fSize;
-        break;
+    case Conv1DOpOrder::NwcBatchless:
+    case Conv1DOpOrder::NwcPoolingBatchless: {
+      bool hasBatchNwc = (conv1DOpOrder == Conv1DOpOrder::Nwc);
+      if (hasBatchNwc) {
+        bindShapeDims(resShapedType, nSize, wSize, fSize);
+        if (oper == ConvOperationKind::Pool)
+          cSize = fSize;
+        if (oper == ConvOperationKind::Conv)
+          bindShapeDims(rhsShapedType, kwSize, cSize);
+        else
+          bindShapeDims(rhsShapedType, kwSize);
+      } else {
+        nSize = 0;
+        if (oper == ConvOperationKind::Conv) {
+          bindShapeDims(resShapedType, wSize, fSize);
+          bindShapeDims(rhsShapedType, kwSize, cSize);
+        } else {
+          bindShapeDims(resShapedType, wSize, cSize);
+          fSize = cSize;
+          bindShapeDims(rhsShapedType, kwSize);
+        }
       }
-      lhsShape = {nSize,
-                  // iw = ow * sw + kw *  dw - 1
-                  //   (i.e. 16 convolved with 3 (@stride 1 dilation 1) -> 14)
-                  // Perform the proper inclusive -> exclusive -> inclusive.
-                  ((wSize - 1) * strideW + 1) + ((kwSize - 1) * dilationW + 1) -
-                      1,
-                  cSize};
-      switch (oper) {
-      case ConvOperationKind::Conv:
-        rhsShape = {kwSize, cSize, fSize};
-        break;
-      case ConvOperationKind::Pool:
-        rhsShape = {kwSize};
-        break;
-      }
-      resShape = {nSize, wSize, fSize};
+      int64_t iwSizeNwc =
+          ((wSize - 1) * strideW + 1) + ((kwSize - 1) * dilationW + 1) - 1;
+      lhsShape = hasBatchNwc ? SmallVector<int64_t, 3>{nSize, iwSizeNwc, cSize}
+                             : SmallVector<int64_t, 3>{iwSizeNwc, cSize};
+      rhsShape = (oper == ConvOperationKind::Conv)
+                     ? SmallVector<int64_t, 3>{kwSize, cSize, fSize}
+                     : SmallVector<int64_t, 3>{kwSize};
+      resShape = hasBatchNwc ? SmallVector<int64_t, 3>{nSize, wSize, fSize}
+                             : SmallVector<int64_t, 3>{wSize, fSize};
       break;
+    }
     case Conv1DOpOrder::Ncw:
-      // out{n, f, w}
-      bindShapeDims(resShapedType, nSize, fSize, wSize);
-      switch (oper) {
-      case ConvOperationKind::Conv:
-        // kernel{f, c, kw}
-        bindShapeDims(rhsShapedType, fSize, cSize, kwSize);
-        break;
-      case ConvOperationKind::Pool:
-        // kernel{kw}
-        bindShapeDims(rhsShapedType, kwSize);
-        cSize = fSize;
-        break;
+    case Conv1DOpOrder::NcwBatchless:
+    case Conv1DOpOrder::NcwPoolingBatchless: {
+      bool hasBatchNcw = (conv1DOpOrder == Conv1DOpOrder::Ncw);
+      if (hasBatchNcw) {
+        bindShapeDims(resShapedType, nSize, fSize, wSize);
+        if (oper == ConvOperationKind::Pool)
+          cSize = fSize;
+        if (oper == ConvOperationKind::Conv)
+          bindShapeDims(rhsShapedType, fSize, cSize, kwSize);
+        else
+          bindShapeDims(rhsShapedType, kwSize);
+      } else {
+        nSize = 0;
+        if (oper == ConvOperationKind::Conv) {
+          bindShapeDims(resShapedType, fSize, wSize);
+          bindShapeDims(rhsShapedType, fSize, cSize, kwSize);
+        } else {
+          bindShapeDims(resShapedType, cSize, wSize);
+          fSize = cSize;
+          bindShapeDims(rhsShapedType, kwSize);
+        }
       }
-      lhsShape = {nSize, cSize,
-                  // iw = ow * sw + kw *  dw - 1
-                  //   (i.e. 16 convolved with 3 (@stride 1 dilation 1) -> 14)
-                  // Perform the proper inclusive -> exclusive -> inclusive.
-                  ((wSize - 1) * strideW + 1) + ((kwSize - 1) * dilationW + 1) -
-                      1};
-      switch (oper) {
-      case ConvOperationKind::Conv:
-        rhsShape = {fSize, cSize, kwSize};
-        break;
-      case ConvOperationKind::Pool:
-        rhsShape = {kwSize};
-        break;
-      }
-      resShape = {nSize, fSize, wSize};
+      int64_t iwSizeNcw =
+          ((wSize - 1) * strideW + 1) + ((kwSize - 1) * dilationW + 1) - 1;
+      lhsShape = hasBatchNcw ? SmallVector<int64_t, 3>{nSize, cSize, iwSizeNcw}
+                             : SmallVector<int64_t, 3>{cSize, iwSizeNcw};
+      rhsShape = (oper == ConvOperationKind::Conv)
+                     ? SmallVector<int64_t, 3>{fSize, cSize, kwSize}
+                     : SmallVector<int64_t, 3>{kwSize};
+      resShape = hasBatchNcw ? SmallVector<int64_t, 3>{nSize, fSize, wSize}
+                             : SmallVector<int64_t, 3>{fSize, wSize};
       break;
+    }
     }
 
     vector::TransferWriteOp write;
@@ -3742,30 +3772,30 @@ public:
         rewriter, loc, resType, resShaped, resPadding,
         /*padding=*/arith::getZeroConstant(rewriter, loc, resEltType));
 
-    // The base vectorization case for channeled convolution is input:
-    // {n,w,c}, weight: {kw,c,f}, output: {n,w,f}. To reuse the base pattern
-    // vectorization case, we do pre transpose on input, weight, and output.
-    switch (conv1DOpOrder) {
-    case Conv1DOpOrder::W:
-    case Conv1DOpOrder::Nwc:
-      // Base case, so no transposes necessary.
-      break;
-    case Conv1DOpOrder::Ncw: {
-      // To match base vectorization case, we pre-transpose current case.
-      // ncw -> nwc
-      static constexpr std::array<int64_t, 3> permLhs = {0, 2, 1};
-      lhs = vector::TransposeOp::create(rewriter, loc, lhs, permLhs);
-      // fcw -> wcf
-      static constexpr std::array<int64_t, 3> permRhs = {2, 1, 0};
-
-      // This is needed only for Conv.
-      if (oper == ConvOperationKind::Conv)
-        rhs = vector::TransposeOp::create(rewriter, loc, rhs, permRhs);
-      // nfw -> nwf
-      static constexpr std::array<int64_t, 3> permRes = {0, 2, 1};
-      res = vector::TransposeOp::create(rewriter, loc, res, permRes);
-      break;
-    }
+    bool hasBatch = (nSize > 0);
+    // Base vectorization uses layout input {n?,w,c}, weight {kw,c,f}, output
+    // {n?,w,f}. Pre-transpose NCW layouts (same permutation, 2D or 3D).
+    bool isNcw = (conv1DOpOrder == Conv1DOpOrder::Ncw ||
+                  conv1DOpOrder == Conv1DOpOrder::NcwBatchless ||
+                  conv1DOpOrder == Conv1DOpOrder::NcwPoolingBatchless);
+    if (isNcw) {
+      if (hasBatch) {
+        lhs = vector::TransposeOp::create(rewriter, loc, lhs,
+                                          ArrayRef<int64_t>{0, 2, 1});
+        if (oper == ConvOperationKind::Conv)
+          rhs = vector::TransposeOp::create(rewriter, loc, rhs,
+                                            ArrayRef<int64_t>{2, 1, 0});
+        res = vector::TransposeOp::create(rewriter, loc, res,
+                                          ArrayRef<int64_t>{0, 2, 1});
+      } else {
+        lhs = vector::TransposeOp::create(rewriter, loc, lhs,
+                                          ArrayRef<int64_t>{1, 0});
+        if (oper == ConvOperationKind::Conv)
+          rhs = vector::TransposeOp::create(rewriter, loc, rhs,
+                                            ArrayRef<int64_t>{2, 1, 0});
+        res = vector::TransposeOp::create(rewriter, loc, res,
+                                          ArrayRef<int64_t>{1, 0});
+      }
     }
 
     //===------------------------------------------------------------------===//
@@ -3786,9 +3816,8 @@ public:
       return kw * (wSize / wSizeStep) + w;
     };
 
-    // Compute contraction: O{n, w, f} += I{n, sw * w + dw * kw, c} * F{c, f}
-    // or perform outerproduct for non-channeled convolution or perform simple
-    // arith operation for pooling
+    // Compute contraction: O{n?, w, f} += I{n?, sw*w + dw*kw, c} * F{c, f}
+    // or outerproduct for non-channeled, or pooling reduction.
     for (int64_t kw = 0; kw < kwSize; ++kw) {
       for (int64_t w = 0; w < wSize; w += wSizeStep) {
         switch (oper) {
@@ -3798,9 +3827,9 @@ public:
                                                    lhsVals[linearIndex(kw, w)],
                                                    rhsVals[kw], resVals[w]);
           } else {
-            resVals[w] = conv1dSliceAsContraction(rewriter, loc,
-                                                  lhsVals[linearIndex(kw, w)],
-                                                  rhsVals[kw], resVals[w]);
+            resVals[w] = conv1dSliceAsContraction(
+                rewriter, loc, lhsVals[linearIndex(kw, w)], rhsVals[kw],
+                resVals[w], hasBatch);
           }
           break;
         case ConvOperationKind::Pool:
@@ -3812,25 +3841,20 @@ public:
     }
 
     res = insertConvResultSlices(rewriter, loc, res, wSize, wSizeStep, resVals,
-                                 isSingleChanneled);
+                                 isSingleChanneled, hasBatch);
     //===------------------------------------------------------------------===//
     // End vector-only rewrite part
     //===------------------------------------------------------------------===//
 
-    // The base vectorization case for channeled convolution is output:
-    // {n,w,f} To reuse the result from base pattern vectorization case, we
-    // post transpose the base case result.
-    switch (conv1DOpOrder) {
-    case Conv1DOpOrder::W:
-    case Conv1DOpOrder::Nwc:
-      // Base case, so no transposes necessary.
-      break;
-    case Conv1DOpOrder::Ncw: {
-      // nwf -> nfw
-      static constexpr std::array<int64_t, 3> perm = {0, 2, 1};
-      res = vector::TransposeOp::create(rewriter, loc, res, perm);
-      break;
-    }
+    // Post-transpose result back to NCW output layout when we pre-transposed.
+    if (isNcw) {
+      if (hasBatch) {
+        static constexpr std::array<int64_t, 3> perm = {0, 2, 1};
+        res = vector::TransposeOp::create(rewriter, loc, res, perm);
+      } else {
+        static constexpr std::array<int64_t, 2> perm = {1, 0};
+        res = vector::TransposeOp::create(rewriter, loc, res, perm);
+      }
     }
 
     return vector::TransferWriteOp::create(rewriter, loc, res, resShaped,
@@ -3871,19 +3895,31 @@ public:
     return nullptr;
   }
 
-  // Create a contraction: lhs{n, w, c} * rhs{c, f} -> res{n, w, f}
+  // Create a contraction: lhs{n?, w, c} * rhs{c, f} -> res{n?, w, f}.
+  // For batchless (hasBatch false), use 2D maps (w, c), (c, f), (w, f).
   Value conv1dSliceAsContraction(RewriterBase &rewriter, Location loc,
-                                 Value lhs, Value rhs, Value res) {
+                                 Value lhs, Value rhs, Value res,
+                                 bool hasBatch = true) {
     vector::IteratorType par = vector::IteratorType::parallel;
     vector::IteratorType red = vector::IteratorType::reduction;
-    AffineExpr n, w, f, c;
-    bindDims(ctx, n, w, f, c);
     lhs = promote(rewriter, loc, lhs, res.getType());
     rhs = promote(rewriter, loc, rhs, res.getType());
+    if (hasBatch) {
+      AffineExpr n, w, f, c;
+      bindDims(ctx, n, w, f, c);
+      auto contrationOp = vector::ContractionOp::create(
+          rewriter, loc, lhs, rhs, res,
+          /*indexingMaps=*/MapList{{n, w, c}, {c, f}, {n, w, f}},
+          /*iteratorTypes=*/ArrayRef<vector::IteratorType>{par, par, par, red});
+      contrationOp.setKind(reductionKind);
+      return contrationOp;
+    }
+    AffineExpr w, f, c;
+    bindDims(ctx, w, f, c);
     auto contrationOp = vector::ContractionOp::create(
         rewriter, loc, lhs, rhs, res,
-        /*indexingMaps=*/MapList{{n, w, c}, {c, f}, {n, w, f}},
-        /*iteratorTypes=*/ArrayRef<vector::IteratorType>{par, par, par, red});
+        /*indexingMaps=*/MapList{{w, c}, {c, f}, {w, f}},
+        /*iteratorTypes=*/ArrayRef<vector::IteratorType>{par, par, red});
     contrationOp.setKind(reductionKind);
     return contrationOp;
   }
@@ -3919,7 +3955,7 @@ public:
   /// > 1.
   FailureOr<Operation *> depthwiseConv(uint64_t channelDimVecSize,
                                        bool channelDimScalableFlag,
-                                       bool flatten) {
+                                       bool flatten, bool hasBatch = true) {
     bool scalableChDim = false;
     bool useMasking = false;
     int64_t nSize, wSize, cSize, kwSize;
@@ -3938,10 +3974,14 @@ public:
     assert(!(useMasking && flatten) &&
            "Unsupported flattened conv with dynamic shapes");
 
-    // out{n, w, c}
-    bindShapeDims(resShapedType, nSize, wSize);
+    // out{n, w, c} (batched) or out{w, c} (batchless)
+    if (hasBatch)
+      bindShapeDims(resShapedType, nSize, wSize);
+    else {
+      nSize = 0;
+      bindShapeDims(resShapedType, wSize, cSize);
+    }
 
-    vector::TransferWriteOp write;
     Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
 
     // w is unrolled (i.e. wSizeStep == 1) iff strideW > 1.
@@ -3949,22 +3989,27 @@ public:
     // unrolling
     int64_t wSizeStep = strideW == 1 ? wSize : 1;
 
+    int64_t iwSize =
+        ((wSize - 1) * strideW + 1) + ((kwSize - 1) * dilationW + 1) - 1;
     Type lhsEltType = lhsShapedType.getElementType();
     Type rhsEltType = rhsShapedType.getElementType();
     Type resEltType = resShapedType.getElementType();
-    VectorType lhsType = VectorType::get(
-        {nSize,
-         // iw = ow * sw + kw *  dw - 1
-         //   (i.e. 16 convolved with 3 (@stride 1 dilation 1) -> 14)
-         ((wSize - 1) * strideW + 1) + ((kwSize - 1) * dilationW + 1) - 1,
-         cSize},
-        lhsEltType, /*scalableDims=*/{false, false, scalableChDim});
+    VectorType lhsType;
+    VectorType resType;
+    if (hasBatch) {
+      lhsType = VectorType::get({nSize, iwSize, cSize}, lhsEltType,
+                                /*scalableDims=*/{false, false, scalableChDim});
+      resType = VectorType::get({nSize, wSize, cSize}, resEltType,
+                                /*scalableDims=*/{false, false, scalableChDim});
+    } else {
+      lhsType = VectorType::get({iwSize, cSize}, lhsEltType,
+                                /*scalableDims=*/{false, scalableChDim});
+      resType = VectorType::get({wSize, cSize}, resEltType,
+                                /*scalableDims=*/{false, scalableChDim});
+    }
     VectorType rhsType =
         VectorType::get({kwSize, cSize}, rhsEltType,
                         /*scalableDims=*/{false, scalableChDim});
-    VectorType resType =
-        VectorType::get({nSize, wSize, cSize}, resEltType,
-                        /*scalableDims=*/{false, false, scalableChDim});
 
     // Masks the input xfer Op along the channel dim, iff the corresponding
     // scalable flag is set.
@@ -3990,10 +4035,10 @@ public:
       return mlir::vector::maskOperation(rewriter, opToMask, maskOp);
     };
 
-    // Read lhs slice of size {n, w * strideW + kw * dilationW, c} @ [0, 0,
-    // 0].
+    // Read lhs slice @ [0, 0, 0] (batched) or [0, 0] (batchless).
     Value lhs = vector::TransferReadOp::create(
-        rewriter, loc, lhsType, lhsShaped, ValueRange{zero, zero, zero},
+        rewriter, loc, lhsType, lhsShaped,
+        hasBatch ? ValueRange{zero, zero, zero} : ValueRange{zero, zero},
         /*padding=*/arith::getZeroConstant(rewriter, loc, lhsEltType));
     auto *maybeMaskedLhs = maybeMaskXferOp(
         lhsType.getShape(), lhsType.getScalableDims(), lhs.getDefiningOp());
@@ -4005,9 +4050,10 @@ public:
     auto *maybeMaskedRhs = maybeMaskXferOp(
         rhsType.getShape(), rhsType.getScalableDims(), rhs.getDefiningOp());
 
-    // Read res slice of size {n, w, c} @ [0, 0, 0].
+    // Read res slice @ [0, 0, 0] (batched) or [0, 0] (batchless).
     Value res = vector::TransferReadOp::create(
-        rewriter, loc, resType, resShaped, ValueRange{zero, zero, zero},
+        rewriter, loc, resType, resShaped,
+        hasBatch ? ValueRange{zero, zero, zero} : ValueRange{zero, zero},
         /*padding=*/arith::getZeroConstant(rewriter, loc, resEltType));
     auto *maybeMaskedRes = maybeMaskXferOp(
         resType.getShape(), resType.getScalableDims(), res.getDefiningOp());
@@ -4017,17 +4063,26 @@ public:
     //===------------------------------------------------------------------===//
     // Unroll along kw and read slices of lhs and rhs.
     SmallVector<Value> lhsVals, rhsVals, resVals;
-    SmallVector<int64_t> inOutSliceSizes = {nSize, wSizeStep, cSize};
-    SmallVector<int64_t> inOutStrides = {1, 1, 1};
+    SmallVector<int64_t> inOutSliceSizes =
+        hasBatch ? SmallVector<int64_t>{nSize, wSizeStep, cSize}
+                 : SmallVector<int64_t>{wSizeStep, cSize};
+    SmallVector<int64_t> inOutStrides =
+        hasBatch ? SmallVector<int64_t>{1, 1, 1} : SmallVector<int64_t>{1, 1};
 
-    // Extract lhs slice of size {n, wSizeStep, c}
-    //   @ [0, sw * w + dw * kw, 0].
+    // Extract lhs slice @ [0, sw*w + dw*kw, 0] (batched) or [sw*w + dw*kw, 0]
+    // (batchless).
     for (int64_t kw = 0; kw < kwSize; ++kw) {
       for (int64_t w = 0; w < wSize; w += wSizeStep) {
-        lhsVals.push_back(vector::ExtractStridedSliceOp::create(
-            rewriter, loc, maybeMaskedLhs->getResult(0),
-            /*offsets=*/ArrayRef<int64_t>{0, w * strideW + kw * dilationW, 0},
-            inOutSliceSizes, inOutStrides));
+        if (hasBatch)
+          lhsVals.push_back(vector::ExtractStridedSliceOp::create(
+              rewriter, loc, maybeMaskedLhs->getResult(0),
+              ArrayRef<int64_t>{0, w * strideW + kw * dilationW, 0},
+              inOutSliceSizes, inOutStrides));
+        else
+          lhsVals.push_back(vector::ExtractStridedSliceOp::create(
+              rewriter, loc, maybeMaskedLhs->getResult(0),
+              ArrayRef<int64_t>{w * strideW + kw * dilationW, 0},
+              inOutSliceSizes, inOutStrides));
       }
     }
     // Extract rhs slice of size {c} @ [kw].
@@ -4036,12 +4091,16 @@ public:
           vector::ExtractOp::create(rewriter, loc, maybeMaskedRhs->getResult(0),
                                     /*offsets=*/ArrayRef<int64_t>{kw}));
     }
-    // Extract res slice: {n, wSizeStep, c} @ [0, w, 0].
+    // Extract res slice @ [0, w, 0] (batched) or [w, 0] (batchless).
     for (int64_t w = 0; w < wSize; w += wSizeStep) {
-      resVals.push_back(vector::ExtractStridedSliceOp::create(
-          rewriter, loc, maybeMaskedRes->getResult(0),
-          /*offsets=*/ArrayRef<int64_t>{0, w, 0}, inOutSliceSizes,
-          inOutStrides));
+      if (hasBatch)
+        resVals.push_back(vector::ExtractStridedSliceOp::create(
+            rewriter, loc, maybeMaskedRes->getResult(0),
+            ArrayRef<int64_t>{0, w, 0}, inOutSliceSizes, inOutStrides));
+      else
+        resVals.push_back(vector::ExtractStridedSliceOp::create(
+            rewriter, loc, maybeMaskedRes->getResult(0),
+            ArrayRef<int64_t>{w, 0}, inOutSliceSizes, ArrayRef<int64_t>{1, 1}));
     }
 
     auto linearIndex = [&](int64_t kw, int64_t w) {
@@ -4049,8 +4108,11 @@ public:
     };
 
     // Note - the scalable flags are ignored as flattening combined with
-    // scalable vectorization is not supported.
-    SmallVector<int64_t> inOutFlattenSliceSizes = {nSize, wSizeStep * cSize};
+    // scalable vectorization is not supported. Flatten is batched-only.
+    assert(!flatten || hasBatch && "flatten requires batched");
+    SmallVector<int64_t> inOutFlattenSliceSizes =
+        hasBatch ? SmallVector<int64_t>{nSize, wSizeStep * cSize}
+                 : SmallVector<int64_t>{wSizeStep * cSize};
     auto lhsTypeAfterFlattening =
         VectorType::get(inOutFlattenSliceSizes, lhsEltType);
     auto resTypeAfterFlattening =
@@ -4091,22 +4153,26 @@ public:
       return rewriter.notifyMatchFailure(op, "failed to create FMA");
     }
 
-    // Write back res slice: {n, wSizeStep, c} @ [0, w, 0].
-    // This does not depend on kw.
+    // Write back res slice: {n, wSizeStep, c} @ [0, w, 0] (batched) or
+    // {wSizeStep, c} @ [w, 0] (batchless).
     for (int64_t w = 0; w < wSize; w += wSizeStep) {
-      maybeMaskedRes = vector::InsertStridedSliceOp::create(
-          rewriter, loc, resVals[w], maybeMaskedRes->getResult(0),
-          /*offsets=*/ArrayRef<int64_t>{0, w, 0},
-          /*strides=*/ArrayRef<int64_t>{1, 1, 1});
+      if (hasBatch)
+        maybeMaskedRes = vector::InsertStridedSliceOp::create(
+            rewriter, loc, resVals[w], maybeMaskedRes->getResult(0),
+            ArrayRef<int64_t>{0, w, 0}, ArrayRef<int64_t>{1, 1, 1});
+      else
+        maybeMaskedRes = vector::InsertStridedSliceOp::create(
+            rewriter, loc, resVals[w], maybeMaskedRes->getResult(0),
+            ArrayRef<int64_t>{w, 0}, ArrayRef<int64_t>{1, 1});
     }
     //===------------------------------------------------------------------===//
     // End vector-only rewrite part
     //===------------------------------------------------------------------===//
 
-    // Write back res slice of size {n, w, c} @ [0, 0, 0].
+    // Write back res slice @ [0, 0, 0] (batched) or [0, 0] (batchless).
     Operation *resOut = vector::TransferWriteOp::create(
         rewriter, loc, maybeMaskedRes->getResult(0), resShaped,
-        ValueRange{zero, zero, zero});
+        hasBatch ? ValueRange{zero, zero, zero} : ValueRange{zero, zero});
     return maybeMaskXferOp(resType.getShape(), resType.getScalableDims(),
                            resOut);
   }
@@ -4178,92 +4244,120 @@ public:
     return rewriter.notifyMatchFailure(op, "not a conv::W layout");
   }
 
-  /// Entry point that transposes into the common form:
-  ///   {{n, strideW * w + dilationW * kw, c}, {kw, c, f}, {n, w, f}}
+  /// Nwc conv (batched or batchless). Batched: {{n, strideW*w + dilationW*kw,
+  /// c}, {kw, c, f}, {n, w, f}}. Batchless: {{strideW*w + dilationW*kw, c},
+  /// {kw, c, f}, {w, f}}.
   FailureOr<Operation *> generateNwcConv() {
     AffineExpr n, w, f, kw, c;
     bindDims(ctx, n, w, f, kw, c);
-    if (!iters({Par(), Par(), Par(), Red(), Red()}))
-      return rewriter.notifyMatchFailure(
-          op, "failed to match conv::Nwc 3-par 2-red");
-
-    // No transposition needed.
-    if (layout({/*lhsIndex*/ {n, strideW * w + dilationW * kw, c},
+    if (iters({Par(), Par(), Par(), Red(), Red()}) &&
+        layout({/*lhsIndex*/ {n, strideW * w + dilationW * kw, c},
                 /*rhsIndex*/ {kw, c, f},
                 /*resIndex*/ {n, w, f}}))
       return conv(Conv1DOpOrder::Nwc);
 
-    return rewriter.notifyMatchFailure(op, "not a conv::Nwc layout");
+    bindDims(ctx, w, f, kw, c);
+    if (iters({Par(), Par(), Red(), Red()}) &&
+        layout({/*lhsIndex*/ {strideW * w + dilationW * kw, c},
+                /*rhsIndex*/ {kw, c, f},
+                /*resIndex*/ {w, f}}))
+      return conv(Conv1DOpOrder::NwcBatchless);
+
+    return rewriter.notifyMatchFailure(
+        op, "not a conv::Nwc layout (batched or batchless)");
   }
 
-  /// Entry point that transposes into the common form:
-  ///   {{n, c, strideW * w + dilationW * kw}, {f, c, kw}, {n, f, w}}
+  /// Ncw conv (batched or batchless). Batched: {{n, c, strideW*w +
+  /// dilationW*kw}, {f, c, kw}, {n, f, w}}. Batchless: {{c, strideW*w +
+  /// dilationW*kw}, {f, c, kw}, {f, w}}.
   FailureOr<Operation *> generateNcwConv() {
     AffineExpr n, w, f, kw, c;
     bindDims(ctx, n, f, w, c, kw);
-    if (!iters({Par(), Par(), Par(), Red(), Red()}))
-      return rewriter.notifyMatchFailure(
-          op, "failed to match conv::Ncw 3-par 2-red");
-
-    if (layout({/*lhsIndex*/ {n, c, strideW * w + dilationW * kw},
+    if (iters({Par(), Par(), Par(), Red(), Red()}) &&
+        layout({/*lhsIndex*/ {n, c, strideW * w + dilationW * kw},
                 /*rhsIndex*/ {f, c, kw},
                 /*resIndex*/ {n, f, w}}))
       return conv(Conv1DOpOrder::Ncw);
 
-    return rewriter.notifyMatchFailure(op, "not a conv::Ncw layout");
+    bindDims(ctx, w, f, kw, c);
+    if (iters({Par(), Par(), Red(), Red()}) &&
+        layout({/*lhsIndex*/ {c, strideW * w + dilationW * kw},
+                /*rhsIndex*/ {f, c, kw},
+                /*resIndex*/ {f, w}}))
+      return conv(Conv1DOpOrder::NcwBatchless);
+
+    return rewriter.notifyMatchFailure(
+        op, "not a conv::Ncw layout (batched or batchless)");
   }
 
-  /// Entry point that transposes into the common form:
-  ///   {{n, strideW * w + dilationW * kw, c}, {kw}, {n, w, c}} for pooling
+  /// Nwc pooling (batched or batchless). Batched: {{n, strideW*w +
+  /// dilationW*kw, c}, {kw}, {n, w, c}}. Batchless: {{strideW*w + dilationW*kw,
+  /// c}, {kw}, {w, c}}.
   FailureOr<Operation *> generateNwcPooling() {
     AffineExpr n, w, c, kw;
     bindDims(ctx, n, w, c, kw);
-    if (!iters({Par(), Par(), Par(), Red()}))
-      return rewriter.notifyMatchFailure(op,
-                                         "failed to match pooling 3-par 1-red");
-
-    // No transposition needed.
-    if (layout({/*lhsIndex*/ {n, strideW * w + dilationW * kw, c},
+    if (iters({Par(), Par(), Par(), Red()}) &&
+        layout({/*lhsIndex*/ {n, strideW * w + dilationW * kw, c},
                 /*rhsIndex*/ {kw},
                 /*resIndex*/ {n, w, c}}))
       return conv(Conv1DOpOrder::Nwc);
 
-    return rewriter.notifyMatchFailure(op, "not a pooling::Nwc layout");
+    bindDims(ctx, w, c, kw);
+    if (iters({Par(), Par(), Red()}) &&
+        layout({/*lhsIndex*/ {strideW * w + dilationW * kw, c},
+                /*rhsIndex*/ {kw},
+                /*resIndex*/ {w, c}}))
+      return conv(Conv1DOpOrder::NwcPoolingBatchless);
+
+    return rewriter.notifyMatchFailure(
+        op, "not a pooling::Nwc layout (batched or batchless)");
   }
 
-  /// Entry point that transposes into the common form:
-  ///   {{n, c, strideW * w + dilationW * kw}, {kw}, {n, c, w}} for pooling
+  /// Ncw pooling (batched or batchless). Batched: {{n, c, strideW*w +
+  /// dilationW*kw}, {kw}, {n, c, w}}. Batchless: {{c, strideW*w +
+  /// dilationW*kw}, {kw}, {c, w}}.
   FailureOr<Operation *> generateNcwPooling() {
     AffineExpr n, w, c, kw;
     bindDims(ctx, n, c, w, kw);
-    if (!iters({Par(), Par(), Par(), Red()}))
-      return rewriter.notifyMatchFailure(op,
-                                         "failed to match pooling 3-par 1-red");
-
-    if (layout({/*lhsIndex*/ {n, c, strideW * w + dilationW * kw},
+    if (iters({Par(), Par(), Par(), Red()}) &&
+        layout({/*lhsIndex*/ {n, c, strideW * w + dilationW * kw},
                 /*rhsIndex*/ {kw},
                 /*resIndex*/ {n, c, w}}))
       return conv(Conv1DOpOrder::Ncw);
 
-    return rewriter.notifyMatchFailure(op, "not a pooling::Ncw layout");
+    bindDims(ctx, c, w, kw);
+    if (iters({Par(), Par(), Red()}) &&
+        layout({/*lhsIndex*/ {c, strideW * w + dilationW * kw},
+                /*rhsIndex*/ {kw},
+                /*resIndex*/ {c, w}}))
+      return conv(Conv1DOpOrder::NcwPoolingBatchless);
+
+    return rewriter.notifyMatchFailure(
+        op, "not a pooling::Ncw layout (batched or batchless)");
   }
 
   /// Entry point that transposes into the common form:
-  ///   {{n, strideW * w + dilationW * kw, c}, {kw, c}, {n, w, c}}
+  ///   Batched: {{n, strideW * w + dilationW * kw, c}, {kw, c}, {n, w, c}}
+  ///   Batchless: {{strideW * w + dilationW * kw, c}, {kw, c}, {w, c}}
   FailureOr<Operation *> generateDilatedConv(uint64_t vecChDimSize = 0,
                                              bool vecChDimScalableFlag = false,
                                              bool flatten = false) {
     AffineExpr n, w, c, kw;
     bindDims(ctx, n, w, c, kw);
-    if (!iters({Par(), Par(), Par(), Red()}))
-      return rewriter.notifyMatchFailure(
-          op, "failed to match depthwise::Nwc conv 3-par 1-red");
-
-    // No transposition needed.
-    if (layout({/*lhsIndex*/ {n, strideW * w + dilationW * kw, c},
+    if (iters({Par(), Par(), Par(), Red()}) &&
+        layout({/*lhsIndex*/ {n, strideW * w + dilationW * kw, c},
                 /*rhsIndex*/ {kw, c},
                 /*resIndex*/ {n, w, c}}))
-      return depthwiseConv(vecChDimSize, vecChDimScalableFlag, flatten);
+      return depthwiseConv(vecChDimSize, vecChDimScalableFlag, flatten,
+                           /*hasBatch=*/true);
+
+    bindDims(ctx, w, c, kw);
+    if (iters({Par(), Par(), Red()}) &&
+        layout({/*lhsIndex*/ {strideW * w + dilationW * kw, c},
+                /*rhsIndex*/ {kw, c},
+                /*resIndex*/ {w, c}}))
+      return depthwiseConv(vecChDimSize, vecChDimScalableFlag, flatten,
+                           /*hasBatch=*/false);
 
     return rewriter.notifyMatchFailure(op, "not a depthwise::Nwc layout");
   }
@@ -4338,15 +4432,12 @@ static FailureOr<Operation *> vectorizeConvolution(
   if (!inputVecSizes.empty()) {
     // Only use the input vector size corresponding to the channel dim. Other
     // vector dims will be inferred from the Ops.
-    assert((isaConvolutionOpOfType<linalg::DepthwiseConv1DNwcWcOp>(op) ||
-            isaConvolutionOpOfType<linalg::DepthwiseConv1DNcwCwOp>(op)) &&
-           "Not a 1D depthwise conv!");
-    size_t chDimIdx = 0;
-    if (isaConvolutionOpOfType<linalg::DepthwiseConv1DNwcWcOp>(op))
-      chDimIdx = 2;
-    if (isaConvolutionOpOfType<linalg::DepthwiseConv1DNcwCwOp>(op))
-      chDimIdx = 1;
-
+    FailureOr<ConvolutionDimensions> convDims = getDepthwiseConvDims(op);
+    if (failed(convDims))
+      return failure();
+    unsigned chDimIdx = convDims->depth.front();
+    if (chDimIdx >= inputVecSizes.size())
+      return failure();
     vecChDimSize = inputVecSizes[chDimIdx];
     vecChDimScalableFlag = inputScalableVecDims[chDimIdx];
   }

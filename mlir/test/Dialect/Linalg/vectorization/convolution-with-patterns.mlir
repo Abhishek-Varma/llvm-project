@@ -781,6 +781,66 @@ module attributes {transform.with_named_sequence} {
 
 // -----
 
+#map_batchless_dw_in = affine_map<(d0, d1, d2) -> (d0 + d2 * 2, d1)>
+#map_batchless_dw_fil = affine_map<(d0, d1, d2) -> (d2, d1)>
+#map_batchless_dw_out = affine_map<(d0, d1, d2) -> (d0, d1)>
+func.func @depthwise_conv1d_wc_wc_2x4xf32_memref_batchless(
+    %input: memref<4x4xf32>, %filter: memref<2x4xf32>, %output: memref<2x4xf32>) {
+  linalg.generic {
+    indexing_maps = [#map_batchless_dw_in, #map_batchless_dw_fil, #map_batchless_dw_out],
+    iterator_types = ["parallel", "parallel", "reduction"]
+  } ins(%input, %filter : memref<4x4xf32>, memref<2x4xf32>)
+    outs(%output : memref<2x4xf32>) {
+    ^bb0(%in: f32, %f: f32, %out: f32):
+    %mul = arith.mulf %in, %f : f32
+    %add = arith.addf %mul, %out : f32
+    linalg.yield %add : f32
+  }
+  return
+}
+
+//       CHECK: func @depthwise_conv1d_wc_wc_2x4xf32_memref_batchless
+//  CHECK-SAME:   (%[[INPUT:[0-9a-z]+]]: memref<4x4xf32>, %[[FILTER:[0-9a-z]+]]: memref<2x4xf32>, %[[OUTPUT:[0-9a-z]+]]: memref<2x4xf32>)
+
+//   CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+//   CHECK-DAG:   %[[F0:.+]] = arith.constant 0.000000e+00 : f32
+
+/// Read the whole data in one shot (batchless: 2D).
+//      CHECK:   %[[V_INPUT_R:.+]] = vector.transfer_read %[[INPUT]][%[[C0]], %[[C0]]], %[[F0]]
+//      CHECK:  %[[V_FILTER_R:.+]] = vector.transfer_read %[[FILTER]][%[[C0]], %[[C0]]], %[[F0]]
+//      CHECK:  %[[V_OUTPUT_R:.+]] = vector.transfer_read %[[OUTPUT]][%[[C0]], %[[C0]]], %[[F0]]
+
+//      CHECK:   %[[V_INPUT_0:.+]] = vector.extract_strided_slice %[[V_INPUT_R]]
+// CHECK-SAME:     {offsets = [0, 0], sizes = [2, 4], strides = [1, 1]} : vector<4x4xf32> to vector<2x4xf32>
+//      CHECK:   %[[V_INPUT_1:.+]] = vector.extract_strided_slice %[[V_INPUT_R]]
+// CHECK-SAME:     {offsets = [2, 0], sizes = [2, 4], strides = [1, 1]} : vector<4x4xf32> to vector<2x4xf32>
+
+//      CHECK:  %[[V_FILTER_0:.+]] = vector.extract %[[V_FILTER_R]][0] : vector<4xf32> from vector<2x4xf32>
+//      CHECK:  %[[V_FILTER_1:.+]] = vector.extract %[[V_FILTER_R]][1] : vector<4xf32> from vector<2x4xf32>
+
+/// w == 0, kw = 0
+//      CHECK:  %[[B_FILTER_0:.*]] = vector.broadcast %[[V_FILTER_0]] : vector<4xf32> to vector<2x4xf32>
+//      CHECK:  %[[FMA_0:.*]] = vector.fma %[[V_INPUT_0]], %[[B_FILTER_0]], %[[V_OUTPUT_R]] : vector<2x4xf32>
+
+/// w == 0, kw = 1
+//      CHECK:  %[[B_FILTER_1:.*]] = vector.broadcast %[[V_FILTER_1]] : vector<4xf32> to vector<2x4xf32>
+//      CHECK:  %[[FMA_1:.*]] = vector.fma %[[V_INPUT_1]], %[[B_FILTER_1]], %[[FMA_0]] : vector<2x4xf32>
+
+// Write the result back in one shot.
+//      CHECK:   vector.transfer_write %[[FMA_1]], %[[OUTPUT]][%[[C0]], %[[C0]]]
+
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.depthwise_conv_1d_nwc_wc", "linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.get_parent_op %0 {isolated_from_above} : (!transform.any_op) -> !transform.any_op
+    %2 = transform.structured.vectorize_children_and_apply_patterns %1 : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
 func.func @depthwise_conv1d_nwc_wc_3x5x4xi8_memref(%input: memref<3x5x4xi8>, %filter: memref<2x4xi8>, %output: memref<3x2x4xi32>) {
   linalg.depthwise_conv_1d_nwc_wc
     {dilations = dense<2> : tensor<1xi64>, strides = dense<1> : tensor<1xi64>}
@@ -1266,6 +1326,84 @@ func.func @pooling_ncw_sum_memref_2_3_2_1(%input: memref<4x2x5xf32>, %filter: me
 module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
     %0 = transform.structured.match ops{["linalg.pooling_ncw_sum", "linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.get_parent_op %0 {isolated_from_above} : (!transform.any_op) -> !transform.any_op
+    %2 = transform.structured.vectorize_children_and_apply_patterns %1 : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+// Batchless 1D conv (generic only): no batch dimension; input (iw, c), filter (kw, c, f), output (w, f).
+#map_conv_in = affine_map<(d0, d1, d2, d3) -> (d0 + d2, d3)>
+#map_conv_fil = affine_map<(d0, d1, d2, d3) -> (d2, d3, d1)>
+#map_conv_out = affine_map<(d0, d1, d2, d3) -> (d0, d1)>
+func.func @batchless_conv_nwc(%input: memref<5x3xf32>, %filter: memref<1x3x8xf32>, %output: memref<4x8xf32>) {
+  linalg.generic {
+    indexing_maps = [#map_conv_in, #map_conv_fil, #map_conv_out],
+    iterator_types = ["parallel", "parallel", "reduction", "reduction"]
+  } ins(%input, %filter : memref<5x3xf32>, memref<1x3x8xf32>)
+    outs(%output : memref<4x8xf32>) {
+  ^bb0(%in: f32, %fil: f32, %out: f32):
+    %mul = arith.mulf %in, %fil : f32
+    %add = arith.addf %mul, %out : f32
+    linalg.yield %add : f32
+  }
+  return
+}
+
+// CHECK-LABEL: func.func @batchless_conv_nwc
+// CHECK-SAME: (%[[INPUT:.+]]: memref<5x3xf32>, %[[FILTER:.+]]: memref<1x3x8xf32>, %[[OUTPUT:.+]]: memref<4x8xf32>)
+// CHECK-DAG: %[[Vc0:.+]] = arith.constant 0 : index
+// CHECK-DAG: %[[Vcst:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK: %[[V0:.+]] = vector.transfer_read %[[INPUT]][%[[Vc0]], %[[Vc0]]], %[[Vcst]] {in_bounds = [true, true]} : memref<5x3xf32>, vector<4x3xf32>
+// CHECK: %[[V1:.+]] = vector.transfer_read %[[FILTER]][%[[Vc0]], %[[Vc0]], %[[Vc0]]], %[[Vcst]] {in_bounds = [true, true, true]} : memref<1x3x8xf32>, vector<1x3x8xf32>
+// CHECK: %[[V2:.+]] = vector.transfer_read %[[OUTPUT]][%[[Vc0]], %[[Vc0]]], %[[Vcst]] {in_bounds = [true, true]} : memref<4x8xf32>, vector<4x8xf32>
+// CHECK: %[[V3:.+]] = vector.extract %[[V1]][0] : vector<3x8xf32> from vector<1x3x8xf32>
+// CHECK: %[[V4:.+]] = vector.contract
+// CHECK-SAME: iterator_types = ["parallel", "parallel", "reduction"]
+// CHECK-SAME: %[[V0]], %[[V3]], %[[V2]]
+// CHECK-SAME: : vector<4x3xf32>, vector<3x8xf32> into vector<4x8xf32>
+// CHECK: vector.transfer_write %[[V4]], %[[OUTPUT]][%[[Vc0]], %[[Vc0]]] {in_bounds = [true, true]} : vector<4x8xf32>, memref<4x8xf32>
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.conv_1d_nwc_wcf", "linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %1 = transform.get_parent_op %0 {isolated_from_above} : (!transform.any_op) -> !transform.any_op
+    %2 = transform.structured.vectorize_children_and_apply_patterns %1 : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+// Batchless 1D pooling (generic): no batch; input (iw, c), filter (kw), output (w, c).
+#map_pool_in = affine_map<(d0, d1, d2) -> (d0 + d2, d1)>
+#map_pool_fil = affine_map<(d0, d1, d2) -> (d2)>
+#map_pool_out = affine_map<(d0, d1, d2) -> (d0, d1)>
+func.func @batchless_pooling_nwc_sum(%input: memref<5x3xf32>, %filter: memref<1xf32>, %output: memref<4x3xf32>) {
+  linalg.generic {
+    indexing_maps = [#map_pool_in, #map_pool_fil, #map_pool_out],
+    iterator_types = ["parallel", "parallel", "reduction"]
+  } ins(%input, %filter : memref<5x3xf32>, memref<1xf32>)
+    outs(%output : memref<4x3xf32>) {
+  ^bb0(%in: f32, %fil: f32, %out: f32):
+    %add = arith.addf %in, %out : f32
+    linalg.yield %add : f32
+  }
+  return
+}
+
+// CHECK-LABEL: func.func @batchless_pooling_nwc_sum
+// CHECK-SAME: (%[[INPUT:.+]]: memref<5x3xf32>, %[[FILTER:.+]]: memref<1xf32>, %[[OUTPUT:.+]]: memref<4x3xf32>)
+// CHECK-DAG: %[[Vc0:.+]] = arith.constant 0 : index
+// CHECK-DAG: %[[Vcst:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK: %[[V0:.+]] = vector.transfer_read %[[INPUT]][%[[Vc0]], %[[Vc0]]], %[[Vcst]] {in_bounds = [true, true]} : memref<5x3xf32>, vector<4x3xf32>
+// CHECK: %[[V1:.+]] = vector.transfer_read %[[OUTPUT]][%[[Vc0]], %[[Vc0]]], %[[Vcst]] {in_bounds = [true, true]} : memref<4x3xf32>, vector<4x3xf32>
+// CHECK: %[[V2:.+]] = arith.addf %[[V0]], %[[V1]] : vector<4x3xf32>
+// CHECK: vector.transfer_write %[[V2]], %[[OUTPUT]][%[[Vc0]], %[[Vc0]]] {in_bounds = [true, true]} : vector<4x3xf32>, memref<4x3xf32>
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["linalg.pooling_nwc_sum", "linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     %1 = transform.get_parent_op %0 {isolated_from_above} : (!transform.any_op) -> !transform.any_op
     %2 = transform.structured.vectorize_children_and_apply_patterns %1 : (!transform.any_op) -> !transform.any_op
     transform.yield
