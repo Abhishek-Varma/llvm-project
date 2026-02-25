@@ -3489,6 +3489,16 @@ static int64_t getOutputChannelSize(LinalgOp op,
   return getChannelSize(op, dims);
 }
 
+/// Collect dimension positions that appear in \p expr.
+static SmallVector<unsigned> getExprDimPositions(AffineExpr expr) {
+  SmallVector<unsigned> dims;
+  expr.walk([&](AffineExpr e) {
+    if (auto d = dyn_cast<AffineDimExpr>(e))
+      dims.push_back(d.getPosition());
+  });
+  return dims;
+}
+
 /// Classify each result dimension of an indexing map as 0=batch, 1=spatial,
 /// 2=channel (for LHS/result); for RHS use 0=filter, 1=channel,
 /// 2=output_channel.
@@ -3511,6 +3521,25 @@ static SmallVector<int> getCanonicalOrder(AffineMap map,
         order[i] = isRhs ? 1 : 2; // channel
       else if (llvm::is_contained(dims.outputChannel, loopIdx))
         order[i] = isRhs ? 2 : 2; // output channel (RHS) or channel (result)
+    }
+  }
+  // LHS/result: unassigned dimensions that use only outputImage+filterLoop
+  // are spatial (e.g. stride*w + dilation*kw).
+  if (!isRhs) {
+    SmallVector<unsigned> spatialLoops(dims.outputImage.begin(),
+                                       dims.outputImage.end());
+    spatialLoops.append(dims.filterLoop.begin(), dims.filterLoop.end());
+    for (unsigned i = 0; i < map.getNumResults(); ++i) {
+      if (order[i] != -1)
+        continue;
+      SmallVector<unsigned> used = getExprDimPositions(map.getResult(i));
+      if (used.empty())
+        continue;
+      bool onlySpatial = llvm::all_of(used, [&](unsigned p) {
+        return llvm::is_contained(spatialLoops, p);
+      });
+      if (onlySpatial)
+        order[i] = 1;
     }
   }
   return order;
@@ -3581,7 +3610,7 @@ static Operation *createTransferWrite(RewriterBase &rewriter, Location loc,
 }
 
 /// Extract LHS slice for kernel position \p kw. Canonical lhs is [batch?], iw,
-/// c or 1D (w) for W-only.
+/// c or 1D (w) for W-only. Returns null if the slice would be out of bounds.
 static Value extractLhsSlice(RewriterBase &rewriter, Location loc, Value lhsVec,
                              int64_t kw, int strideW, int dilationW,
                              int64_t batchSize, int64_t wSize, int64_t cSize,
@@ -3592,6 +3621,8 @@ static Value extractLhsSlice(RewriterBase &rewriter, Location loc, Value lhsVec,
   int sliceStrideW = (wSize == 1) ? 1 : strideW;
   if (lhsType.getRank() == 1) {
     // W-only: 1D input (iw), slice [wSize] at offset spatialOffset.
+    if (spatialOffset + wSize > lhsType.getShape()[0])
+      return {};
     return vector::ExtractStridedSliceOp::create(
         rewriter, loc, lhsVec, /*offsets=*/{spatialOffset},
         /*sizes=*/{wSize}, /*strides=*/{sliceStrideW});
@@ -3606,6 +3637,10 @@ static Value extractLhsSlice(RewriterBase &rewriter, Location loc, Value lhsVec,
     sizes = {wSize, cSize};
     strides = {sliceStrideW, 1};
   }
+  ArrayRef<int64_t> shape = lhsType.getShape();
+  for (size_t i = 0; i < offsets.size(); ++i)
+    if (offsets[i] + sizes[i] > shape[i])
+      return {};
   return vector::ExtractStridedSliceOp::create(rewriter, loc, lhsVec, offsets,
                                                sizes, strides);
 }
@@ -3799,6 +3834,9 @@ static FailureOr<Operation *> vectorizeConvGeneric(
       ShapedType::isDynamic(cSize) || ShapedType::isDynamic(fSize) ||
       (hasBatch && ShapedType::isDynamic(batchSize)))
     return failure();
+  // Reject zero/negative sizes (would create invalid vector types in slices).
+  if (wSize <= 0 || kwSize <= 0 || cSize <= 0 || fSize <= 0 || batchSize <= 0)
+    return failure();
 
   // 6. Load vectors and transpose to canonical
   Value lhs = op.getDpsInputOperand(0)->get();
@@ -3818,12 +3856,23 @@ static FailureOr<Operation *> vectorizeConvGeneric(
   if (!resPerm.empty())
     resVec = rewriter.create<vector::TransposeOp>(loc, resVec, resPerm);
 
+  // Ensure LHS spatial extent is large enough for all kernel positions.
+  auto lhsVecType = cast<VectorType>(lhsVec.getType());
+  unsigned spatialDim = hasBatch ? 1 : 0;
+  if (spatialDim >= lhsVecType.getRank())
+    return failure();
+  int64_t lhsSpatialExtent = lhsVecType.getShape()[spatialDim];
+  if ((kwSize - 1) * dilationW + wSize > lhsSpatialExtent)
+    return failure();
+
   // 7. Single loop over kernel
   Value result = resVec;
   for (int64_t kw = 0; kw < kwSize; ++kw) {
     Value lhsSlice =
         extractLhsSlice(rewriter, loc, lhsVec, kw, strideW, dilationW,
                         batchSize, wSize, cSize, hasBatch);
+    if (!lhsSlice)
+      return failure();
     Value rhsSlice =
         vector::ExtractOp::create(rewriter, loc, rhsVec, ArrayRef<int64_t>{kw});
 
